@@ -1,0 +1,9 @@
+---
+apiVersion: ros.io/v1
+kind: BackupJob
+metadata:
+  name: example-backup-job
+spec:
+  source_pvc: example-volume
+  repository:
+    name: restic-rest-config 

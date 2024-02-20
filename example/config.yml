@@ -1,0 +1,6 @@
+---
+backup_job_image: ghcr.io/jess-sol/restic-k8s/job:latest
+
+snap_class_mappings:
+- storage_class: csi-hostpath-sc
+  snapshot_class: csi-hostpath-snapclass
