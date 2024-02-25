@@ -13,6 +13,12 @@ pub struct AppConfig {
     pub worker_service_account_name: String,
 }
 
+pub struct WorkerConfig {
+    pub service_account_name: String,
+    pub role_name: String,
+    pub role_binding_name: String,
+}
+
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
 pub struct StorageClassToSnapshotClass {
     pub storage_class: String,

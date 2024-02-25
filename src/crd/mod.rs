@@ -1,6 +1,8 @@
 pub mod job;
 pub mod schedule;
 
+use std::fmt::Display;
+
 pub use job::*;
 use k8s_openapi::List;
 pub use schedule::*;
@@ -21,4 +23,14 @@ pub fn generate_crds() -> String {
 pub struct SecretRef {
     pub name: String,
     pub namespace: Option<String>,
+}
+
+impl Display for SecretRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(ns) = self.namespace {
+            write!(f, "{}/", ns)?;
+        }
+        write!(f, "{}", self.name)?;
+        Ok(())
+    }
 }

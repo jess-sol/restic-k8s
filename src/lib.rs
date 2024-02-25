@@ -1,8 +1,15 @@
 use config::AppConfig;
 use futures::StreamExt;
-use k8s_openapi::api::{batch::v1::Job, core::v1::PersistentVolumeClaim};
+use k8s_openapi::{
+    api::{
+        batch::v1::Job,
+        core::v1::{PersistentVolumeClaim, Secret, ServiceAccount},
+        rbac::v1::{ClusterRole, RoleBinding},
+    },
+    apimachinery::pkg::apis::meta::v1::OwnerReference,
+};
 use serde_json::json;
-use std::{future, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, fs::read_to_string, future, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use crd::{BackupJob, BackupJobState, BackupSchedule};
@@ -268,60 +275,36 @@ impl BackupJob {
                     return Ok(Action::requeue(Duration::from_secs(5)));
                 }
 
-                let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+                let operator_namespace = self.spec.repository.namespace.clone().unwrap_or(
+                    read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+                        .expect("Unable to get default repository secret namespace"),
+                );
 
-                // Create backup Job
-                let created_job = jobs
-                    .create(
-                        &PostParams::default(),
-                        &serde_json::from_value(json!({
-                            "apiVersion": "batch/v1",
-                            "kind": "Job",
-                            "metadata": {
-                                "generateName": format!("{WALLE}-{}-", &self.spec.source_pvc),
-                                "namespace": self.namespace(),
-                                "labels": {
-                                    "app.kubernetes.io/created-by": WALLE,
-                                },
-                                "ownerReferences": [self.controller_owner_ref(&()).unwrap()],
-                            },
-                            "spec": {
-                                "template": {
-                                    "metadata": {
-                                        "name": job_name,
-                                    },
-                                    "spec": {
-                                        "serviceAccountName": ctx.config.worker_service_account_name,
-                                        "containers": [{
-                                            "name": "restic",
-                                            "image": ctx.config.backup_job_image,
-                                            "args": [],
-                                            // Add PVC as tag, namespace as tag, set host as k8s
-                                            // cluster name, make configurable
-                                            "env": [
-                                                { "name": "REPOSITORY_SECRET", "value": &self.spec.repository },
-                                                { "name": "OPERATOR_NAMESPACE", "value": &ns },
-                                                { "name": "K8S_CLUSTER_NAME", "value": ctx.config.cluster_name },
-                                                { "name": "TRACE_ID", "value": telemetry::get_trace_id().to_string() },
+                let job_builder = JobBuilder {
+                    name_ref: format!("{WALLE}-{}-", &self.spec.source_pvc),
+                    namespace: ns.clone(),
+                    service_account: ctx.config.worker_service_account_name.clone(),
+                    repository_secret: self.spec.repository.name.clone(),
+                    repository_secret_ns: operator_namespace.clone(),
+                    owner_references: vec![self.controller_owner_ref(&()).unwrap()],
+                    image: ctx.config.backup_job_image.clone(),
+                    task: "backup".to_string(),
+                    env: maplit::btreemap![
+                        "REPOSITORY_SECRET" => self.spec.repository.to_string(),
+                        "OPERATOR_NAMESPACE" => operator_namespace.clone(),
+                        "K8S_CLUSTER_NAME" => ctx.config.cluster_name.clone(),
+                        "TRACE_ID" => telemetry::get_trace_id().to_string(),
 
-                                                { "name": "SOURCE_PATH", "value": format!("/data/{}/", self.spec.source_pvc) },
-                                                { "name": "SNAPSHOT_TIME", "value": self.status.as_ref().expect("BackupJob must have status before it begins").start_time.as_ref().expect("BackupJob must have start_time before it begins") },
-                                                { "name": "PVC_NAME", "value": &self.spec.source_pvc },
-                                                { "name": "CSI_NAME", "value": "" },
-                                            ],
-                                            // "envFrom": [{ "secretRef": { "name": &self.spec.repository } }] // TODO - how to make namespace agnostic
-                                        }],
-                                        "restartPolicy": "Never",
-                                    }
-                                }
-                            }
-                        }))
-                        .unwrap(),
-                    )
-                    .await
-                    .with_context(|_| KubeSnafu {
-                        msg: "Failed to create snapshot for backupjob",
-                    })?;
+                        "SOURCE_PATH" => format!("/data/{}/", self.spec.source_pvc),
+                        "SNAPSHOT_TIME" => self.status.as_ref().expect("BackupJob must have status before it begins")
+                            .start_time.as_ref().expect("BackupJob must have start_time before it begins").to_string(),
+                        "PVC_NAME" => self.spec.source_pvc.clone(),
+                    ],
+                };
+
+                let client = kube::Client::try_default().await.unwrap();
+                job_builder.ensure_rbac(&client).await;
+                let created_job = job_builder.create_job(&client).await.unwrap();
 
                 let _o = backup_jobs
                     .patch_status(
@@ -426,6 +409,161 @@ impl BackupJob {
             .await
             .with_context(|_| KubeSnafu { msg: "Failed to record backupjob event" })?;
         Ok(Action::await_change())
+    }
+}
+
+struct JobBuilder {
+    name_ref: String, // What the job is working on, usually a pvc name
+    namespace: String,
+
+    service_account: String,
+    repository_secret: String,
+    repository_secret_ns: String,
+
+    owner_references: Vec<OwnerReference>,
+    image: String,
+    task: String,
+    env: BTreeMap<&'static str, String>,
+}
+
+impl JobBuilder {
+    /// Ensure RBAC is properly configured for the job to be able to access the resources it needs
+    /// when created with the provided service account in the provided namespace.
+    /// Namely access to the repository_secret reference.
+    pub async fn ensure_rbac(&self, client: &kube::Client) {
+        let secrets: Api<Secret> = Api::namespaced(client.clone(), &self.repository_secret_ns);
+        let secret = secrets.get(&self.repository_secret).await.unwrap();
+
+        // 1. Create serviceaccount/walle-worker in src_ns
+        let service_accounts: Api<ServiceAccount> =
+            Api::namespaced(client.clone(), &self.namespace);
+
+        let service_account = service_accounts
+            .create(
+                &PostParams::default(),
+                &serde_json::from_value(json!({
+                    "apiVersion": "v1",
+                    "kind": "ServiceAccount",
+                    "metadata": {
+                        "name": "walle-worker",
+                        // TODO - Add helm labels
+                    }
+                }))
+                .expect("Invalid predefined service account json"),
+            )
+            .await
+            .unwrap();
+
+        // 2. Create clusterrole
+        let cluster_roles: Api<ClusterRole> = Api::all(client.clone());
+
+        let cluster_role = cluster_roles
+            .create(
+                &PostParams::default(),
+                &serde_json::from_value(json!({
+                    "apiVersion": "rbac.authorization.k8s.io/v1",
+                    "kind": "ClusterRole",
+                    "metadata": {
+                        "name": format!("walle-read-{}", self.repository_secret),
+                        "ownerReferences": [secret.controller_owner_ref(&())],
+                    },
+                    "rules": [{
+                        "apiGroups": [""],
+                        "resources": ["secrets"],
+                        "resourceNames": [self.repository_secret],
+                        "verbs": ["get"],
+                    }],
+                }))
+                .expect("Invalid predefined cluster role json"),
+            )
+            .await
+            .unwrap();
+
+        // 3. Create or update rolebinding in secret_ns
+        let role_bindings: Api<RoleBinding> =
+            Api::namespaced(client.clone(), &self.repository_secret_ns);
+
+        let binding_name = format!("walle-read-{}", self.repository_secret);
+        let role_binding =
+            if let Some(_role_binding) = role_bindings.get_opt(&binding_name).await.unwrap() {
+                role_bindings
+                    .patch(
+                        &binding_name,
+                        &PatchParams::apply(WALLE),
+                        &Patch::Merge(json!({
+                            "subjects": [{
+                                "kind": "ServiceAccount",
+                                "name": service_account.name_any(),
+                                "namespace": self.namespace,
+                            }]
+                        })),
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                role_bindings
+                    .create(
+                        &PostParams::default(),
+                        &serde_json::from_value(json!({
+                            "apiVersion": "rbac.authorization.k8s.io/v1",
+                            "kind": "RoleBinding",
+                            "metadata": {
+                                "name": format!("walle-read-{}", self.repository_secret),
+                                "ownerReferences": [secret.controller_owner_ref(&())],
+                            },
+                            "roleRef": {
+                                "apiGroup": "rbac.authorization.k8s.io",
+                                "kind": "ClusterRole",
+                                "name": cluster_role.name_any(),
+                            },
+                            "subjects": [{
+                                "kind": "ServiceAccount",
+                                "name": service_account.name_any(),
+                                "namespace": self.namespace,
+                            }]
+                        }))
+                        .expect("Invalid predefined cluster role json"),
+                    )
+                    .await
+                    .unwrap()
+            };
+    }
+
+    pub async fn create_job(&self, client: &Client) -> Result<Job> {
+        let jobs: Api<Job> = Api::namespaced(client.clone(), &self.namespace);
+
+        jobs.create(&PostParams::default(), &serde_json::from_value(self.job_spec()).unwrap())
+            .await
+            .with_context(|_| KubeSnafu { msg: "Failed to create snapshot for backupjob" })
+    }
+
+    fn job_spec(&self) -> serde_json::Value {
+        json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "generateName": format!("{WALLE}-{}-{}-", &self.task, &self.name_ref),
+                "namespace": self.namespace,
+                "labels": {
+                    "app.kubernetes.io/created-by": WALLE,
+                },
+                "ownerReferences": self.owner_references.as_slice(),
+            },
+            "spec": {
+                "template": {
+                    "spec": {
+                        "serviceAccountName": &self.service_account,
+                        "containers": [{
+                            "name": "restic",
+                            "image": &self.image,
+                            "args": &[&self.task],
+                            "env": &self.env,
+                        }],
+                        "restartPolicy": "Never",
+                    }
+                }
+            }
+        })
     }
 }
 
