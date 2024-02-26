@@ -9,7 +9,9 @@ use k8s_openapi::{
     apimachinery::pkg::apis::meta::v1::OwnerReference,
 };
 use serde_json::json;
-use std::{collections::BTreeMap, fs::read_to_string, future, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap, fs::read_to_string, future, str::FromStr, sync::Arc, time::Duration,
+};
 
 use chrono::{DateTime, Utc};
 use crd::{BackupJob, BackupJobState, BackupSchedule};
@@ -275,10 +277,20 @@ impl BackupJob {
                     return Ok(Action::requeue(Duration::from_secs(5)));
                 }
 
-                let operator_namespace = self.spec.repository.namespace.clone().unwrap_or(
-                    read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-                        .expect("Unable to get default repository secret namespace"),
-                );
+                let snapshot_creation_time = snapshot_status
+                    .get("creationTime")
+                    .and_then(|x| x.as_str())
+                    .map(|x| {
+                        chrono::DateTime::from_str(x)
+                            .expect("Unable to parse creationTime from snapshot status")
+                    })
+                    .unwrap_or(Utc::now());
+
+                let operator_namespace =
+                    self.spec.repository.namespace.clone().unwrap_or_else(|| {
+                        read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+                            .expect("Unable to get default repository secret namespace")
+                    });
 
                 let job_builder = JobBuilder {
                     name_ref: format!("{WALLE}-{}-", &self.spec.source_pvc),
@@ -296,8 +308,7 @@ impl BackupJob {
                         "TRACE_ID" => telemetry::get_trace_id().to_string(),
 
                         "SOURCE_PATH" => format!("/data/{}/", self.spec.source_pvc),
-                        "SNAPSHOT_TIME" => self.status.as_ref().expect("BackupJob must have status before it begins")
-                            .start_time.as_ref().expect("BackupJob must have start_time before it begins").to_string(),
+                        "SNAPSHOT_TIME" => snapshot_creation_time.to_string(),
                         "PVC_NAME" => self.spec.source_pvc.clone(),
                     ],
                 };
@@ -313,7 +324,7 @@ impl BackupJob {
                         &Patch::Merge(json!({
                             "status": {
                                 "state": BackupJobState::BackingUp,
-                                "start_time": Some(Utc::now()),
+                                "start_time": Some(snapshot_creation_time),
                                 "backup_job": Some(created_job.name_any()),
                             },
                         })),
@@ -321,6 +332,7 @@ impl BackupJob {
                     .await
                     .with_context(|_| KubeSnafu { msg: "Failed up update backupjob status" })?;
             }
+
             BackupJobState::BackingUp => {
                 let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
                 let Some(job) = jobs
@@ -397,8 +409,7 @@ impl BackupJob {
     // Finalizer cleanup (the object was deleted, ensure nothing is orphaned)
     async fn cleanup(&self, ctx: Arc<Context>) -> Result<Action> {
         let recorder = ctx.diagnostics.read().await.recorder(ctx.client.clone(), self);
-        // Document doesn't have any real cleanup, so we just publish an event
-        recorder
+        let result = recorder
             .publish(Event {
                 type_: EventType::Normal,
                 reason: "DeleteRequested".into(),
@@ -406,8 +417,12 @@ impl BackupJob {
                 action: "Deleting".into(),
                 secondary: None,
             })
-            .await
-            .with_context(|_| KubeSnafu { msg: "Failed to record backupjob event" })?;
+            .await;
+        // Don't let failure to update the events of the resource stop the finalizer from
+        // completing. This breaks the deletion of namespaces.
+        if let Err(err) = result {
+            warn!(?err, backup_job = ?self, "Failed to add deletion event to backupjob");
+        }
         Ok(Action::await_change())
     }
 }
@@ -434,50 +449,60 @@ impl JobBuilder {
         let secrets: Api<Secret> = Api::namespaced(client.clone(), &self.repository_secret_ns);
         let secret = secrets.get(&self.repository_secret).await.unwrap();
 
-        // 1. Create serviceaccount/walle-worker in src_ns
+        // 1. Create serviceaccount/walle-worker in the backup job namespace
         let service_accounts: Api<ServiceAccount> =
             Api::namespaced(client.clone(), &self.namespace);
 
-        let service_account = service_accounts
-            .create(
-                &PostParams::default(),
-                &serde_json::from_value(json!({
-                    "apiVersion": "v1",
-                    "kind": "ServiceAccount",
-                    "metadata": {
-                        "name": "walle-worker",
-                        // TODO - Add helm labels
-                    }
-                }))
-                .expect("Invalid predefined service account json"),
-            )
-            .await
-            .unwrap();
+        let service_account =
+            if let Some(sa) = service_accounts.get_opt("walle-worker").await.unwrap() {
+                sa
+            } else {
+                service_accounts
+                    .create(
+                        &PostParams::default(),
+                        &serde_json::from_value(json!({
+                            "apiVersion": "v1",
+                            "kind": "ServiceAccount",
+                            "metadata": {
+                                "name": "walle-worker",
+                                // TODO - Add helm labels
+                            }
+                        }))
+                        .expect("Invalid predefined service account json"),
+                    )
+                    .await
+                    .unwrap()
+            };
 
         // 2. Create clusterrole
         let cluster_roles: Api<ClusterRole> = Api::all(client.clone());
 
-        let cluster_role = cluster_roles
-            .create(
-                &PostParams::default(),
-                &serde_json::from_value(json!({
-                    "apiVersion": "rbac.authorization.k8s.io/v1",
-                    "kind": "ClusterRole",
-                    "metadata": {
-                        "name": format!("walle-read-{}", self.repository_secret),
-                        "ownerReferences": [secret.controller_owner_ref(&())],
-                    },
-                    "rules": [{
-                        "apiGroups": [""],
-                        "resources": ["secrets"],
-                        "resourceNames": [self.repository_secret],
-                        "verbs": ["get"],
-                    }],
-                }))
-                .expect("Invalid predefined cluster role json"),
-            )
-            .await
-            .unwrap();
+        let role_name = format!("walle-read-{}", self.repository_secret);
+        let cluster_role = if let Some(role) = cluster_roles.get_opt(&role_name).await.unwrap() {
+            role
+        } else {
+            cluster_roles
+                .create(
+                    &PostParams::default(),
+                    &serde_json::from_value(json!({
+                        "apiVersion": "rbac.authorization.k8s.io/v1",
+                        "kind": "ClusterRole",
+                        "metadata": {
+                            "name": role_name,
+                            "ownerReferences": [secret.controller_owner_ref(&())],
+                        },
+                        "rules": [{
+                            "apiGroups": [""],
+                            "resources": ["secrets"],
+                            "resourceNames": [self.repository_secret],
+                            "verbs": ["get"],
+                        }],
+                    }))
+                    .expect("Invalid predefined cluster role json"),
+                )
+                .await
+                .unwrap()
+        };
 
         // 3. Create or update rolebinding in secret_ns
         let role_bindings: Api<RoleBinding> =
@@ -538,6 +563,12 @@ impl JobBuilder {
     }
 
     fn job_spec(&self) -> serde_json::Value {
+        let env = self
+            .env
+            .iter()
+            .map(|(k, v)| json!({ "name": k, "value": v }))
+            .collect::<serde_json::Value>();
+
         json!({
             "apiVersion": "batch/v1",
             "kind": "Job",
@@ -557,7 +588,7 @@ impl JobBuilder {
                             "name": "restic",
                             "image": &self.image,
                             "args": &[&self.task],
-                            "env": &self.env,
+                            "env": &env,
                         }],
                         "restartPolicy": "Never",
                     }

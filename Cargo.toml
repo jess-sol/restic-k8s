@@ -34,3 +34,7 @@ opentelemetry-otlp = "0.14.0"
 futures = "0.3.30"
 config = "0.14.0"
 maplit = "1.0.2"
+async-trait = "0.1.77"
+
+[dev-dependencies]
+test-context = "0.1.4"

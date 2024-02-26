@@ -27,7 +27,7 @@ pub struct SecretRef {
 
 impl Display for SecretRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(ns) = self.namespace {
+        if let Some(ref ns) = self.namespace {
             write!(f, "{}/", ns)?;
         }
         write!(f, "{}", self.name)?;
