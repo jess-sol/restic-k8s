@@ -1,20 +1,21 @@
 use config::AppConfig;
 use futures::StreamExt;
 use k8s_openapi::api::batch::v1::Job;
-use std::{future, sync::Arc, time::Duration};
+use std::{future, hash::Hash, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use crd::{BackupJob, BackupSchedule};
 use kube::{
     api::ListParams,
-    core::{DynamicObject, GroupVersionKind},
+    core::{DynamicObject, GroupVersionKind, ObjectMeta},
     runtime::{
         controller::Action,
         events::{Recorder, Reporter},
         finalizer::{finalizer, Event as FinalizerEvent},
+        reflector::Store,
         watcher, Controller,
     },
-    Api, Client, Resource as _, ResourceExt,
+    Api, Client, Resource, ResourceExt,
 };
 use serde::Serialize;
 use snafu::ResultExt as _;
@@ -69,19 +70,28 @@ impl State {
     }
 
     // Create a Controller Context that can update State
-    pub fn to_context(&self, client: Client) -> Arc<Context> {
+    pub fn to_context<T: Clone + Resource + 'static>(
+        &self, client: Client, store: Store<T>,
+    ) -> Arc<Context<T>>
+    where
+        T::DynamicType: Eq + Hash,
+    {
         Arc::new(Context {
             client,
             config: self.config.clone(),
             metrics: Metrics::default().register(&self.registry).unwrap(),
             diagnostics: self.diagnostics.clone(),
+            store,
         })
     }
 }
 
 // Context for our reconciler
 #[derive(Clone)]
-pub struct Context {
+pub struct Context<T: Clone + Resource + 'static>
+where
+    T::DynamicType: Eq + Hash,
+{
     /// Kubernetes client
     pub client: Client,
     /// Diagnostics read by the web server
@@ -90,37 +100,12 @@ pub struct Context {
     pub metrics: Metrics,
     /// Application configuration
     pub config: AppConfig,
-}
 
-#[instrument(skip(ctx, backup_job), fields(trace_id))]
-async fn reconcile(backup_job: Arc<BackupJob>, ctx: Arc<Context>) -> Result<Action> {
-    let trace_id = telemetry::get_trace_id();
-    Span::current().record("trace_id", &field::display(&trace_id));
-    let _timer = ctx.metrics.count_and_measure();
-    ctx.diagnostics.write().await.last_event = Utc::now();
-    let ns = backup_job.namespace().unwrap(); // doc is namespace scoped
-    let backup_jobs: Api<BackupJob> = Api::namespaced(ctx.client.clone(), &ns);
-
-    info!("Reconciling Document \"{}\" in {}", backup_job.name_any(), ns);
-    finalizer(&backup_jobs, BACKUP_JOB_FINALIZER, backup_job, |event| async {
-        match event {
-            FinalizerEvent::Cleanup(backup_job) => backup_job.cleanup(ctx.clone()).await,
-            FinalizerEvent::Apply(backup_job) => backup_job.reconcile(ctx.clone()).await,
-        }
-    })
-    .await
-    .with_context(|_| FinalizerSnafu)
-}
-
-fn error_policy(doc: Arc<BackupJob>, error: &AppError, ctx: Arc<Context>) -> Action {
-    warn!("reconcile failed: {:?}", error);
-    ctx.metrics.reconcile_failure(&doc, error);
-    Action::requeue(Duration::from_secs(5 * 60))
+    pub store: Store<T>,
 }
 
 impl BackupSchedule {
-    async fn reconcile(&self, ctx: Arc<Context>) -> Result<Action> {
-        // create_backup_jobs()
+    async fn reconcile(&self, ctx: Arc<Context<Self>>) -> Result<Action> {
         // 1. For each plan:
         //   1. Find workloads based on selector & namespace_selector
         //   2. Get PVCs tied to workloads
@@ -136,6 +121,25 @@ impl BackupSchedule {
         // - Create BackupJobs
 
         Ok(Action::requeue(Duration::from_secs(60 * 5)))
+    }
+
+    pub async fn cleanup(&self, ctx: Arc<Context<Self>>) -> Result<Action> {
+        // let recorder = ctx.diagnostics.read().await.recorder(ctx.client.clone(), self);
+        // let result = recorder
+        //     .publish(Event {
+        //         type_: EventType::Normal,
+        //         reason: "DeleteRequested".into(),
+        //         note: Some(format!("Delete `{}`", self.name_any())),
+        //         action: "Deleting".into(),
+        //         secondary: None,
+        //     })
+        //     .await;
+        // // Don't let failure to update the events of the resource stop the finalizer from
+        // // completing. This breaks the deletion of namespaces.
+        // if let Err(err) = result {
+        //     warn!(?err, backup_job = ?self, "Failed to add deletion event to backupjob");
+        // }
+        Ok(Action::await_change())
     }
 }
 
@@ -159,9 +163,77 @@ impl Diagnostics {
     }
 }
 
+struct Scheduler {
+    schedules: Store<BackupSchedule>,
+}
+
 /// Initialize the controller and shared state (given the crd is installed)
 pub async fn run(state: State) {
     let client = Client::try_default().await.expect("failed to create kube Client");
+
+    tokio::join!(
+        run_backup_jobs(client.clone(), state.clone()),
+        run_backup_schedules(client, state)
+    );
+}
+
+pub async fn run_backup_schedules(client: Client, state: State) {
+    let backup_schedules = Api::<BackupSchedule>::all(client.clone());
+    if let Err(e) = backup_schedules.list(&ListParams::default().limit(1)).await {
+        error!("CRD is not queryable; {e:?}. Is the CRD installed?");
+        info!("Installation: cargo run --bin crdgen | kubectl apply -f -");
+        std::process::exit(1);
+    }
+
+    let wc = watcher::Config::default().any_semantic();
+    let backup_jobs = Api::<BackupJob>::all(client.clone());
+
+    let controller = Controller::new(backup_schedules, wc.clone())
+        .owns(backup_jobs, wc.clone())
+        .shutdown_on_signal();
+    let store = controller.store();
+    controller
+        .run(
+            reconcile_backup_schedule,
+            error_policy_backup_schedule,
+            state.to_context(client, store),
+        )
+        .filter_map(|x| async move { std::result::Result::ok(x) })
+        .for_each(|_| future::ready(()))
+        .await;
+}
+
+#[instrument(skip(ctx, backup_schedule), fields(trace_id))]
+async fn reconcile_backup_schedule(
+    backup_schedule: Arc<BackupSchedule>, ctx: Arc<Context<BackupSchedule>>,
+) -> Result<Action> {
+    let trace_id = telemetry::get_trace_id();
+    Span::current().record("trace_id", &field::display(&trace_id));
+    let _timer = ctx.metrics.count_and_measure();
+    ctx.diagnostics.write().await.last_event = Utc::now();
+    let ns = backup_schedule.namespace().unwrap(); // doc is namespace scoped
+    let backup_schedules: Api<BackupSchedule> = Api::namespaced(ctx.client.clone(), &ns);
+
+    info!("Reconciling Document \"{}\" in {}", backup_schedule.name_any(), ns);
+    finalizer(&backup_schedules, BACKUP_JOB_FINALIZER, backup_schedule, |event| async {
+        match event {
+            FinalizerEvent::Cleanup(backup_schedule) => backup_schedule.cleanup(ctx.clone()).await,
+            FinalizerEvent::Apply(backup_schedule) => backup_schedule.reconcile(ctx.clone()).await,
+        }
+    })
+    .await
+    .with_context(|_| FinalizerSnafu)
+}
+
+fn error_policy_backup_schedule(
+    backup_schedule: Arc<BackupSchedule>, error: &AppError, ctx: Arc<Context<BackupSchedule>>,
+) -> Action {
+    warn!("reconcile failed: {:?}", error);
+    ctx.metrics.reconcile_failure(&backup_schedule.name_any(), error); // TODO
+    Action::requeue(Duration::from_secs(5 * 60))
+}
+
+pub async fn run_backup_jobs(client: Client, state: State) {
     let backup_jobs = Api::<BackupJob>::all(client.clone());
     if let Err(e) = backup_jobs.list(&ListParams::default().limit(1)).await {
         error!("CRD is not queryable; {e:?}. Is the CRD installed?");
@@ -176,12 +248,44 @@ pub async fn run(state: State) {
     let (snapshot_ar, _caps) = kube::discovery::pinned_kind(&client, &gvk).await.unwrap();
     let snapshots = Api::<DynamicObject>::all_with(client.clone(), &snapshot_ar);
 
-    Controller::new(backup_jobs, wc.clone())
+    let controller = Controller::new(backup_jobs, wc.clone())
         .owns(jobs, wc.clone())
         .owns_with(snapshots, snapshot_ar, wc)
-        .shutdown_on_signal()
-        .run(reconcile, error_policy, state.to_context(client))
+        .shutdown_on_signal();
+    let store = controller.store();
+    controller
+        .run(reconcile_backup_job, error_policy, state.to_context(client, store))
         .filter_map(|x| async move { std::result::Result::ok(x) })
         .for_each(|_| future::ready(()))
         .await;
+}
+
+#[instrument(skip(ctx, backup_job), fields(trace_id))]
+async fn reconcile_backup_job(
+    backup_job: Arc<BackupJob>, ctx: Arc<Context<BackupJob>>,
+) -> Result<Action> {
+    let trace_id = telemetry::get_trace_id();
+    Span::current().record("trace_id", &field::display(&trace_id));
+    let _timer = ctx.metrics.count_and_measure();
+    ctx.diagnostics.write().await.last_event = Utc::now();
+    let ns = backup_job.namespace().unwrap(); // doc is namespace scoped
+    let backup_jobs: Api<BackupJob> = Api::namespaced(ctx.client.clone(), &ns);
+
+    info!("Reconciling Document \"{}\" in {}", backup_job.name_any(), ns);
+    finalizer(&backup_jobs, BACKUP_JOB_FINALIZER, backup_job, |event| async {
+        match event {
+            FinalizerEvent::Cleanup(backup_job) => backup_job.cleanup(ctx.clone()).await,
+            FinalizerEvent::Apply(backup_job) => backup_job.reconcile(ctx.clone()).await,
+        }
+    })
+    .await
+    .with_context(|_| FinalizerSnafu)
+}
+
+fn error_policy(
+    backup_job: Arc<BackupJob>, error: &AppError, ctx: Arc<Context<BackupJob>>,
+) -> Action {
+    warn!("reconcile failed: {:?}", error);
+    ctx.metrics.reconcile_failure(&backup_job.name_any(), error);
+    Action::requeue(Duration::from_secs(5 * 60))
 }

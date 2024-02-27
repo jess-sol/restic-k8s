@@ -24,7 +24,7 @@ use crate::tasks::backup::{create_backup_job, ensure_rbac};
 use crate::{Context, InvalidPVCSnafu, KubeSnafu, Result, WALLE};
 
 impl BackupJob {
-    pub async fn reconcile(&self, ctx: Arc<Context>) -> Result<Action> {
+    pub async fn reconcile(&self, ctx: Arc<Context<Self>>) -> Result<Action> {
         let client = ctx.client.clone();
         let recorder = ctx.diagnostics.read().await.recorder(client.clone(), self);
         let ns = self.namespace().unwrap();
@@ -300,7 +300,7 @@ impl BackupJob {
     }
 
     // Finalizer cleanup (the object was deleted, ensure nothing is orphaned)
-    pub async fn cleanup(&self, ctx: Arc<Context>) -> Result<Action> {
+    pub async fn cleanup(&self, ctx: Arc<Context<Self>>) -> Result<Action> {
         let recorder = ctx.diagnostics.read().await.recorder(ctx.client.clone(), self);
         let result = recorder
             .publish(Event {

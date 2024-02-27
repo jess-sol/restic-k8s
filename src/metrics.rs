@@ -42,8 +42,8 @@ impl Metrics {
         Ok(self)
     }
 
-    pub fn reconcile_failure(&self, doc: &BackupJob, e: &AppError) {
-        self.failures.with_label_values(&[doc.name_any().as_ref(), e.metric_label().as_ref()]).inc()
+    pub fn reconcile_failure(&self, name: &str, e: &AppError) {
+        self.failures.with_label_values(&[name, e.metric_label().as_ref()]).inc()
     }
 
     pub fn count_and_measure(&self) -> ReconcileMeasurer {
