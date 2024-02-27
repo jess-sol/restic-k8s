@@ -2,14 +2,17 @@ use std::{
     collections::BTreeMap,
     fs::read_to_string,
     io,
+    ops::Deref,
     process::{Command, ExitCode, ExitStatus},
+    task::Wake,
 };
 
 use clap::{Parser, Subcommand};
 use k8s_openapi::api::core::v1::Secret;
 use kube::Api;
 use snafu::{Backtrace, ResultExt, Snafu};
-use tracing::{error, info};
+use tokio::runtime::Builder;
+use tracing::{debug, error, info};
 use tracing_subscriber::{prelude::*, EnvFilter};
 
 type Result<T, E = Error> = ::std::result::Result<T, E>;
@@ -30,6 +33,7 @@ fn main() -> Result<()> {
 
     match args.command {
         Commands::Backup { source_path, snapshot_time, pvc_name } => do_backup(
+            args.restic_path.unwrap_or("/restic".to_string()),
             args.k8s_cluster_name,
             args.operator_namespace,
             namespace,
@@ -67,6 +71,9 @@ struct Cli {
 
     #[arg(long, env)]
     operator_namespace: Option<String>,
+
+    #[arg(long, env)]
+    restic_path: Option<String>,
 }
 
 #[derive(Debug, Snafu)]
@@ -101,17 +108,31 @@ enum Commands {
 }
 
 fn do_backup(
-    k8s_cluster_name: String, operator_namespace: Option<String>, namespace: String,
-    repository_secret: String, source_path: String, snapshot_time: String, pvc_name: String,
+    restic_path: String, k8s_cluster_name: String, operator_namespace: Option<String>,
+    namespace: String, repository_secret: String, source_path: String, snapshot_time: String,
+    pvc_name: String,
 ) -> Result<()> {
     info!("Starting restic, output being redirected...");
 
-    let repo_env_vars = smol::block_on(async {
+    let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+
+    let repo_env_vars = runtime.block_on(async {
         let client = kube::Client::try_default().await.expect("Unable to create Kubernetes client");
         get_repository_secret(client, operator_namespace, repository_secret).await
     });
 
-    let mut process = Command::new("restic")
+    info!(
+        "Backing up to {}, on host {}, with tags {},{}, at time {}",
+        repo_env_vars.get("RESTIC_REPOSITORY").map_or("<unset repository>", String::deref),
+        k8s_cluster_name,
+        pvc_name,
+        namespace,
+        snapshot_time
+    );
+    debug!("Starting restic {}", restic_path);
+
+    println!("<<<<<<<<<< START OUTPUT");
+    let mut process = Command::new(restic_path)
         .args([
             "backup",
             "--group-by",
@@ -120,17 +141,18 @@ fn do_backup(
             &k8s_cluster_name,
             "--time",
             &snapshot_time,
-            "--tags",
+            "--tag",
             &format!("{pvc_name},{namespace}"),
             ".",
         ])
         .envs(repo_env_vars)
         .current_dir(source_path)
         .spawn()
-        .with_context(|_| ProcessIOSnafu)?;
+        .with_context(|_| ProcessSpawnSnafu)?;
 
     // Even though communication pipes have closed, ensure process has also exited.
     let exit_status = process.wait().with_context(|_| ProcessIOSnafu)?;
+    println!("END OUTPUT >>>>>>>>>>");
 
     if !exit_status.success() {
         let exit = ResticExitCodes::new(exit_status);
@@ -210,7 +232,13 @@ fn decode_secret(secret: &Secret) -> BTreeMap<String, String> {
 
 #[derive(Debug, Snafu)]
 enum BackupError {
-    #[snafu(display("Failed to run restic subprocess: {source}\n{backtrace}"))]
+    #[snafu(display("Failed to spawn restic subprocess: {source}\n{backtrace}"))]
+    ProcessSpawnError {
+        source: io::Error,
+        #[snafu(backtrace)]
+        backtrace: Backtrace,
+    },
+    #[snafu(display("Failed to process IO of restic subprocess: {source}\n{backtrace}"))]
     ProcessIOError {
         source: io::Error,
         #[snafu(backtrace)]

@@ -3,10 +3,10 @@ use futures::StreamExt;
 use k8s_openapi::{
     api::{
         batch::v1::Job,
-        core::v1::{PersistentVolumeClaim, Secret, ServiceAccount},
+        core::v1::{PersistentVolumeClaim, Pod, Secret, ServiceAccount},
         rbac::v1::{ClusterRole, RoleBinding},
     },
-    apimachinery::pkg::apis::meta::v1::OwnerReference,
+    apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::OwnerReference},
 };
 use serde_json::json;
 use std::{
@@ -16,7 +16,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use crd::{BackupJob, BackupJobState, BackupSchedule};
 use kube::{
-    api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, PropagationPolicy},
+    api::{DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams, PropagationPolicy},
     core::{DynamicObject, GroupVersionKind},
     runtime::{
         controller::Action,
@@ -175,6 +175,30 @@ impl BackupJob {
         let snapshot_name = status.destination_snapshot.as_deref();
         let job_name = status.backup_job.as_deref();
 
+        let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &ns);
+        let Some(pvc) = pvcs.get_opt(&self.spec.source_pvc).await.unwrap() else {
+            recorder
+                .publish(Event {
+                    type_: EventType::Warning,
+                    reason: "MissingPVC".into(),
+                    note: Some("Unable to find source_pvc".to_string()),
+                    action: "Waiting".into(),
+                    secondary: None,
+                })
+                .await
+                .with_context(|_| KubeSnafu { msg: "Unable to send event for backupjob" })?;
+            return Ok(Action::requeue(Duration::from_secs(30)));
+        };
+        let pvc_spec = pvc.spec.with_context(|| InvalidPVCSnafu)?;
+        let storage_class = pvc_spec.storage_class_name.with_context(|| InvalidPVCSnafu)?;
+
+        let snap_class = ctx
+            .config
+            .snap_class_mappings
+            .iter()
+            .find(|x| x.storage_class == storage_class)
+            .map(|x| &x.snapshot_class);
+
         // TODO - Support v1 and v1beta1
         // let apigroup =
         //     kube::discovery::pinned_group(&client, &GroupVersion::gv("snapshot.storage.k8s.io", "v1"))
@@ -187,32 +211,6 @@ impl BackupJob {
 
         match status.state {
             BackupJobState::NotStarted => {
-                let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &ns);
-                let Some(pvc) = pvcs.get_opt(&self.spec.source_pvc).await.unwrap() else {
-                    recorder
-                        .publish(Event {
-                            type_: EventType::Warning,
-                            reason: "MissingPVC".into(),
-                            note: Some("Unable to find source_pvc".to_string()),
-                            action: "Waiting".into(),
-                            secondary: None,
-                        })
-                        .await
-                        .with_context(|_| KubeSnafu {
-                            msg: "Unable to send event for backupjob",
-                        })?;
-                    return Ok(Action::requeue(Duration::from_secs(30)));
-                };
-                let pvc_spec = pvc.spec.with_context(|| InvalidPVCSnafu)?;
-                let storage_class = pvc_spec.storage_class_name.with_context(|| InvalidPVCSnafu)?;
-
-                let snap_class = ctx
-                    .config
-                    .snap_class_mappings
-                    .iter()
-                    .find(|x| x.storage_class == storage_class)
-                    .map(|x| &x.snapshot_class);
-
                 let created_snap = snapshots
                     .create(
                         &PostParams::default(),
@@ -220,7 +218,7 @@ impl BackupJob {
                             "apiVersion": "snapshot.storage.k8s.io/v1",
                             "kind": "VolumeSnapshot",
                             "metadata": {
-                                "generateName": format!("{WALLE}-{}-", &self.spec.source_pvc),
+                                "generateName": format!("{WALLE}-{}", &self.spec.source_pvc),
                                 "namespace": self.namespace(),
                                 "labels": {
                                     "app.kubernetes.io/created-by": WALLE,
@@ -292,23 +290,35 @@ impl BackupJob {
                             .expect("Unable to get default repository secret namespace")
                     });
 
+                let storage_size = pvc_spec
+                    .resources
+                    .and_then(|x| x.requests)
+                    .and_then(|x| x.get("storage").cloned())
+                    .with_context(|| InvalidPVCSnafu)?;
+
                 let job_builder = JobBuilder {
                     name_ref: format!("{WALLE}-{}-", &self.spec.source_pvc),
                     namespace: ns.clone(),
                     service_account: ctx.config.worker_service_account_name.clone(),
                     repository_secret: self.spec.repository.name.clone(),
                     repository_secret_ns: operator_namespace.clone(),
+                    snapshot_name: snapshot_name.unwrap().to_string(),
+                    storage_class,
+                    storage_size,
+                    mount_path: format!("/data/{}/", self.spec.source_pvc),
                     owner_references: vec![self.controller_owner_ref(&()).unwrap()],
                     image: ctx.config.backup_job_image.clone(),
                     task: "backup".to_string(),
                     env: maplit::btreemap![
+                        "RUST_BACKTRACE" => "full".to_string(),
+                        "RUST_LOG" => "trace".to_string(),
                         "REPOSITORY_SECRET" => self.spec.repository.to_string(),
                         "OPERATOR_NAMESPACE" => operator_namespace.clone(),
                         "K8S_CLUSTER_NAME" => ctx.config.cluster_name.clone(),
                         "TRACE_ID" => telemetry::get_trace_id().to_string(),
 
                         "SOURCE_PATH" => format!("/data/{}/", self.spec.source_pvc),
-                        "SNAPSHOT_TIME" => snapshot_creation_time.to_string(),
+                        "SNAPSHOT_TIME" => snapshot_creation_time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true).replace('T', " ").replace('Z', ""),
                         "PVC_NAME" => self.spec.source_pvc.clone(),
                     ],
                 };
@@ -344,6 +354,16 @@ impl BackupJob {
                     return Ok(Action::requeue(Duration::from_secs(5)));
                 };
 
+                // Fetch logs of latest job to add to completion event
+                let logs = latest_logs_of_job(client.clone(), &job).await.unwrap();
+                let logs = logs.as_deref().and_then(|logs| {
+                    recover_block_in_string(
+                        logs,
+                        "<<<<<<<<<< START OUTPUT",
+                        "END OUTPUT >>>>>>>>>>",
+                    )
+                });
+
                 let succeeded = job.status.as_ref().map(|x| x.succeeded.unwrap_or(0)).unwrap_or(0);
                 let failed = job.status.as_ref().map(|x| x.failed.unwrap_or(0)).unwrap_or(0);
 
@@ -373,11 +393,7 @@ impl BackupJob {
                             });
                     }
 
-                    let state = if succeeded > 0 {
-                        BackupJobState::Finished
-                    } else {
-                        BackupJobState::Failed
-                    };
+                    let is_success = succeeded > 0;
 
                     let _o = backup_jobs
                         .patch_status(
@@ -385,7 +401,11 @@ impl BackupJob {
                             &ps,
                             &Patch::Merge(json!({
                                 "status": {
-                                    "state": state,
+                                    "state": if is_success {
+                                        BackupJobState::Finished
+                                    } else {
+                                        BackupJobState::Failed
+                                    },
                                     "backup_job": Option::<String>::None,
                                     "destination_snapshot": Option::<String>::None,
                                     "finish_time": Some(Utc::now()),
@@ -394,6 +414,19 @@ impl BackupJob {
                         )
                         .await
                         .with_context(|_| KubeSnafu { msg: "Failed up update backupjob status" })?;
+
+                    recorder
+                        .publish(Event {
+                            type_: if is_success { EventType::Normal } else { EventType::Warning },
+                            reason: "TaskLogs".into(),
+                            note: logs.map(|logs| format!("Restic logs: {}", logs)),
+                            action: if is_success { "Finished".into() } else { "Failed".into() },
+                            secondary: None,
+                        })
+                        .await
+                        .with_context(|_| KubeSnafu {
+                            msg: "Unable to send event for backupjob",
+                        })?;
                 }
                 return Ok(Action::requeue(Duration::from_secs(30)));
             }
@@ -427,6 +460,34 @@ impl BackupJob {
     }
 }
 
+async fn latest_logs_of_job(
+    client: kube::Client, job: &Job,
+) -> Result<Option<String>, kube::Error> {
+    let pods: Api<Pod> = Api::default_namespaced(client);
+    let matching_pods = pods
+        .list(&ListParams::default().labels(&format!("controller-uid={}", job.uid().unwrap())))
+        .await
+        .unwrap();
+    let latest_pod = matching_pods
+        .items
+        .into_iter()
+        .max_by(|x, y| x.creation_timestamp().cmp(&y.creation_timestamp()));
+
+    if let Some(latest_pod) = latest_pod {
+        Ok(Some(pods.logs(&latest_pod.name_any(), &LogParams::default()).await?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn recover_block_in_string<'a>(
+    lines: &'a str, delim_start: &'_ str, delim_end: &'_ str,
+) -> Option<&'a str> {
+    let (_, tail) = lines.split_once(delim_start)?;
+    let (block, _) = tail.split_once(delim_end)?;
+    Some(block)
+}
+
 struct JobBuilder {
     name_ref: String, // What the job is working on, usually a pvc name
     namespace: String,
@@ -434,6 +495,12 @@ struct JobBuilder {
     service_account: String,
     repository_secret: String,
     repository_secret_ns: String,
+
+    snapshot_name: String,
+    storage_class: String,
+    // snapshot_class: String,
+    mount_path: String,
+    storage_size: Quantity,
 
     owner_references: Vec<OwnerReference>,
     image: String,
@@ -556,13 +623,46 @@ impl JobBuilder {
 
     pub async fn create_job(&self, client: &Client) -> Result<Job> {
         let jobs: Api<Job> = Api::namespaced(client.clone(), &self.namespace);
+        let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &self.namespace);
 
-        jobs.create(&PostParams::default(), &serde_json::from_value(self.job_spec()).unwrap())
+        let pvc = pvcs
+            .create(
+                &PostParams::default(),
+                &serde_json::from_value(json!({
+                    "apiVersion": "v1",
+                    "kind": "PersistentVolumeClaim",
+                    "metadata": {
+                        "generateName": format!("walle-{}-{}", &self.task, &self.name_ref),
+                    },
+                    "spec": {
+                        "storageClassName": self.storage_class,
+                        "dataSource": {
+                            "name": self.snapshot_name,
+                            "kind": "VolumeSnapshot",
+                            "apiGroup": "snapshot.storage.k8s.io"
+                        },
+                        "accessModes": ["ReadWriteOnce"],
+                        "resources": {
+                            "requests": {
+                                "storage": self.storage_size,
+                            }
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
             .await
-            .with_context(|_| KubeSnafu { msg: "Failed to create snapshot for backupjob" })
+            .unwrap();
+
+        jobs.create(
+            &PostParams::default(),
+            &serde_json::from_value(self.job_spec(&pvc.name_any())).unwrap(),
+        )
+        .await
+        .with_context(|_| KubeSnafu { msg: "Failed to create snapshot for backupjob" })
     }
 
-    fn job_spec(&self) -> serde_json::Value {
+    fn job_spec(&self, pvc_name: &str) -> serde_json::Value {
         let env = self
             .env
             .iter()
@@ -573,7 +673,7 @@ impl JobBuilder {
             "apiVersion": "batch/v1",
             "kind": "Job",
             "metadata": {
-                "generateName": format!("{WALLE}-{}-{}-", &self.task, &self.name_ref),
+                "generateName": format!("{WALLE}-{}-{}", &self.task, &self.name_ref),
                 "namespace": self.namespace,
                 "labels": {
                     "app.kubernetes.io/created-by": WALLE,
@@ -583,14 +683,24 @@ impl JobBuilder {
             "spec": {
                 "template": {
                     "spec": {
-                        "serviceAccountName": &self.service_account,
+                        // TODO - Use specific name of SA in ensure_rbac
+                        "serviceAccountName": "walle-worker",
                         "containers": [{
                             "name": "restic",
                             "image": &self.image,
+                            "imagePullPolicy": "Always",
                             "args": &[&self.task],
                             "env": &env,
+                            "volumeMounts": [{
+                                "name": "snapshot",
+                                "mountPath": self.mount_path,
+                            }]
                         }],
                         "restartPolicy": "Never",
+                        "volumes": [{
+                            "name": "snapshot",
+                            "persistentVolumeClaim": { "claimName": pvc_name }
+                        }],
                     }
                 }
             }

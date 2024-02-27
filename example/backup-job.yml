@@ -7,3 +7,4 @@ spec:
   source_pvc: example-volume
   repository:
     name: restic-rest-config 
+    namespace: default

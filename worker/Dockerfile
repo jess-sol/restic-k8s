@@ -16,8 +16,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/git \
   cargo build -p walle-worker --release
 
 FROM alpine:latest
-RUN echo "nobody:x:1:1:nobody:/:/bin/sh" >> /etc/passwd && \
-  echo "nobody:x:1:" >> /etc/group
+RUN sed -i '/^nobody:/d' /etc/passwd && \
+  echo "nobody:x:65534:65534:nobody:/home/nobody:/bin/sh" >> /etc/passwd && \
+  echo "nobody:x:65534:" >> /etc/group && \
+  mkdir /home/nobody && \
+  chown nobody:nobody /home/nobody
 USER nobody:nobody
 COPY --from=restic-build /go/src/restic/restic /
 COPY --from=build /app/target/release/walle-worker /

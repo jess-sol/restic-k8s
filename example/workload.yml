@@ -1,0 +1,44 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test
+  labels:
+    app: test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test
+  template:
+    metadata:
+      labels:
+        app: test
+    spec:
+      containers:
+      - name: alpine
+        image: alpine:latest
+        command: [sh, -c]
+        args:
+        - |
+          while sleep 10; do
+            date >> /data/datelog
+          done
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: example-volume
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: example-volume
+spec:
+  storageClassName: csi-hostpath-sc
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi

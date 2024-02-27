@@ -40,10 +40,10 @@ kubectl patch storageclass csi-hostpath-sc -p '{"metadata": {"annotations":{"sto
 k get crd | grep ros.io | awk '{print $1}' | xargs k delete crd
 cargo run --bin crdgen | k apply -f -
 
-docker build -f worker/Dockerfile . -t ghcr.io/jess-sol/walle/job:latest
-minikube image load ghcr.io/jess-sol/walle/job:latest
+docker build -f worker/Dockerfile . -t ghcr.io/jess-sol/walle/worker:latest --push
+minikube image load ghcr.io/jess-sol/walle/worker:latest
 
-k apply -f example/pvc.yml
+k apply -f example/workload.yml
 k create secret generic restic-rest-config --from-env-file=example/restic-secret.env
 
 APP_CONFIG=example/config.yml cargo run

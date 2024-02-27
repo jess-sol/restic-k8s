@@ -1,5 +1,5 @@
 ---
-backup_job_image: ghcr.io/jess-sol/restic-k8s/job:latest
+backup_job_image: ghcr.io/jess-sol/walle/worker:latest
 cluster_name: minikube
 worker_service_account_name: walle
 
