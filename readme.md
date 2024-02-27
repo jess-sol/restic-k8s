@@ -34,7 +34,7 @@ For workloads:
 Development
 ---
 
-```
+```bash
 minikube start --addons volumesnapshots,csi-hostpath-driver
 kubectl patch storageclass csi-hostpath-sc -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
 k get crd | grep ros.io | awk '{print $1}' | xargs k delete crd
@@ -50,11 +50,3 @@ APP_CONFIG=example/config.yml cargo run
 
 k apply -f example/backup-job.yml
 ```
-
-
-TODO
----
-- [ ] Job spec needs to mount snapshot
-- [ ] Job spec needs to add env vars from secret
-- [ ] Create job Dockerfile
-- [ ] Record failures of job in BackupJob event stream or status
