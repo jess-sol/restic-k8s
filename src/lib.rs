@@ -79,7 +79,7 @@ impl State {
         Arc::new(Context {
             client,
             config: self.config.clone(),
-            metrics: Metrics::default().register(&self.registry).unwrap(),
+            // metrics: Metrics::default().register(&self.registry).unwrap(),
             diagnostics: self.diagnostics.clone(),
             store,
         })
@@ -97,7 +97,7 @@ where
     /// Diagnostics read by the web server
     pub diagnostics: Arc<RwLock<Diagnostics>>,
     /// Prometheus metrics
-    pub metrics: Metrics,
+    // pub metrics: Metrics,
     /// Application configuration
     pub config: AppConfig,
 
@@ -209,7 +209,7 @@ async fn reconcile_backup_schedule(
 ) -> Result<Action> {
     let trace_id = telemetry::get_trace_id();
     Span::current().record("trace_id", &field::display(&trace_id));
-    let _timer = ctx.metrics.count_and_measure();
+    // let _timer = ctx.metrics.count_and_measure();
     ctx.diagnostics.write().await.last_event = Utc::now();
     let ns = backup_schedule.namespace().unwrap(); // doc is namespace scoped
     let backup_schedules: Api<BackupSchedule> = Api::namespaced(ctx.client.clone(), &ns);
@@ -229,7 +229,7 @@ fn error_policy_backup_schedule(
     backup_schedule: Arc<BackupSchedule>, error: &AppError, ctx: Arc<Context<BackupSchedule>>,
 ) -> Action {
     warn!("reconcile failed: {:?}", error);
-    ctx.metrics.reconcile_failure(&backup_schedule.name_any(), error); // TODO
+    // ctx.metrics.reconcile_failure(&backup_schedule.name_any(), error); // TODO
     Action::requeue(Duration::from_secs(5 * 60))
 }
 
@@ -266,7 +266,7 @@ async fn reconcile_backup_job(
 ) -> Result<Action> {
     let trace_id = telemetry::get_trace_id();
     Span::current().record("trace_id", &field::display(&trace_id));
-    let _timer = ctx.metrics.count_and_measure();
+    // let _timer = ctx.metrics.count_and_measure();
     ctx.diagnostics.write().await.last_event = Utc::now();
     let ns = backup_job.namespace().unwrap(); // doc is namespace scoped
     let backup_jobs: Api<BackupJob> = Api::namespaced(ctx.client.clone(), &ns);
@@ -286,6 +286,6 @@ fn error_policy(
     backup_job: Arc<BackupJob>, error: &AppError, ctx: Arc<Context<BackupJob>>,
 ) -> Action {
     warn!("reconcile failed: {:?}", error);
-    ctx.metrics.reconcile_failure(&backup_job.name_any(), error);
+    // ctx.metrics.reconcile_failure(&backup_job.name_any(), error);
     Action::requeue(Duration::from_secs(5 * 60))
 }
