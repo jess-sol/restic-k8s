@@ -213,11 +213,11 @@ impl BackupSchedule {
                     "apiVersion": "ros.io/v1",
                     "kind": "BackupJob",
                     "metadata": {
-                        "generateName": format!("{}-{}", self.meta().name.as_ref().unwrap(), pvc_name),
+                        "generateName": format!("{}-{}-", self.meta().name.as_ref().unwrap(), pvc_name),
                         "ownerReferences": [self.controller_owner_ref(&())],
                     },
                     "spec": {
-                        "source_pvc": pvc_name,
+                        "sourcePvc": pvc_name,
                         "repository": self.spec.repository,
 
                         // TODO - Figure out how to run stuff in workload correctly
@@ -318,7 +318,7 @@ impl Scheduler {
                             "apiVersion": "ros.io/v1",
                             "kind": "BackupSchedule",
                             "status": {
-                                "last_backup_run": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                                "lastBackupRun": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                             }
                         })),
                     )

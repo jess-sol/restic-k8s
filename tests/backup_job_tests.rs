@@ -92,7 +92,7 @@ async fn test_backup_job_rbac_creation(ctx: &mut MyContext) {
                     "name": "test-job",
                 },
                 "spec": {
-                    "source_pvc": "test-volume",
+                    "sourcePvc": "test-volume",
                     "repository": {
                         "name": "test-repo",
                         "namespace": ns_a.name_any(),

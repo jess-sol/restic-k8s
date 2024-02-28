@@ -13,6 +13,14 @@ pub static BACKUP_SCHEDULE_FINALIZER: &str = "ros.io/backup-schedule";
 // #[cfg_attr(test, derive(Default))]
 #[kube(kind = "BackupSchedule", group = "ros.io", version = "v1", namespaced)]
 #[kube(status = "BackupScheduleStatus", shortname = "backup-schedule")]
+// #[kube(
+//     printcolumn = r#"{"name":"State", "type":"string", "description":"Status of BackupJob", "jsonPath":".status.state"}"#
+// )]
+#[kube(
+    printcolumn = r#"{"name":"LastBackup", "type":"date", "jsonPath":".status.last_backup_run"}"#
+)]
+#[kube(printcolumn = r#"{"name":"Age", "type":"date", "jsonPath":".metadata.creationTimestamp"}"#)]
+#[serde(rename_all = "camelCase")]
 pub struct BackupScheduleSpec {
     /// Reference to the secret containing the necessary environment variables to connect to the
     /// Restic repository.
@@ -30,17 +38,20 @@ pub struct BackupScheduleSpec {
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct PruneJobSpec {
     pub interval: IntervalSpec,
     pub retain: RetentionSpec,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct CheckJobSpec {
     pub interval: IntervalSpec,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct BackupPlanSpec {
     /// Type of resource to select, may be any resource with Pod child resources
     #[serde(rename = "type")]
@@ -65,6 +76,7 @@ pub struct BackupPlanSpec {
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct RetentionSpec {
     pub hourly: u32,
     pub daily: u32,
@@ -74,6 +86,7 @@ pub struct RetentionSpec {
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct BackupScheduleStatus {
     // pub condition: String,
     pub last_backup_run: Option<String>,

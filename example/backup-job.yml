@@ -4,7 +4,7 @@ kind: BackupJob
 metadata:
   name: example-backup-job
 spec:
-  source_pvc: example-volume
+  sourcePvc: example-volume
   repository:
     name: restic-rest-config 
     namespace: default

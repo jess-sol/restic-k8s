@@ -14,10 +14,8 @@ pub static BACKUP_JOB_FINALIZER: &str = "ros.io/backup-job";
 #[kube(
     printcolumn = r#"{"name":"Status", "type":"string", "description":"Status of BackupJob", "jsonPath":".status.state"}"#
 )]
-#[kube(
-    printcolumn = r#"{"name":"StartTime", "type":"date", "description":"When backup was started", "jsonPath":".status.startTime"}"#
-)]
-#[kube(printcolumn = r#"{"name":"Age", "type":"date", "jsonPath":".status.creationTime"}"#)]
+#[kube(printcolumn = r#"{"name":"Age", "type":"date", "jsonPath":".status.start_time"}"#)]
+#[serde(rename_all = "camelCase")]
 pub struct BackupJobSpec {
     pub source_pvc: String,
 
@@ -28,6 +26,7 @@ pub struct BackupJobSpec {
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct BackupJobStatus {
     pub state: BackupJobState,
     pub start_time: Option<DateTime<Utc>>,

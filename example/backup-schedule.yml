@@ -7,8 +7,8 @@ spec:
   interval: 60s
   plans:
   - type: pod
-    label_selector: app=test
-    field_selector: metadata.namespace=default
+    labelSelector: app=test
+    fieldSelector: metadata.namespace=default
   repository:
     name: restic-rest-config 
     namespace: default
