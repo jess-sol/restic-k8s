@@ -1,17 +1,29 @@
 use config::AppConfig;
 use futures::StreamExt;
-use k8s_openapi::api::batch::v1::Job;
-use std::{future, hash::Hash, sync::Arc, time::Duration};
+use k8s_openapi::api::{
+    batch::v1::Job,
+    core::v1::{PersistentVolumeClaim, Pod},
+};
+use serde_json::json;
+use std::{
+    collections::BTreeMap,
+    future,
+    hash::Hash,
+    ops::Sub,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use chrono::{DateTime, Utc};
-use crd::{BackupJob, BackupSchedule};
+use crd::{BackupJob, BackupSchedule, BackupScheduleStatus};
 use kube::{
-    api::ListParams,
-    core::{DynamicObject, GroupVersionKind, ObjectMeta},
+    api::{ListParams, Patch, PatchParams, PostParams},
+    core::{DynamicObject, GroupVersionKind},
     runtime::{
         controller::Action,
-        events::{Recorder, Reporter},
-        finalizer::{finalizer, Event as FinalizerEvent},
+        events::{Event, EventType, Recorder, Reporter},
+        finalizer::finalizer,
+        finalizer::Event as FinalizerEvent,
         reflector::Store,
         watcher, Controller,
     },
@@ -19,8 +31,8 @@ use kube::{
 };
 use serde::Serialize;
 use snafu::ResultExt as _;
-use tokio::sync::RwLock;
-use tracing::{error, field, info, instrument, warn, Span};
+use tokio::{join, sync::RwLock, time::Instant};
+use tracing::{debug, error, field, info, instrument, warn, Span};
 
 pub mod backup_job;
 pub mod config;
@@ -31,7 +43,6 @@ pub mod tasks;
 pub mod telemetry;
 
 pub use error::*;
-use metrics::Metrics;
 
 use crate::crd::BACKUP_JOB_FINALIZER;
 
@@ -106,19 +117,32 @@ where
 
 impl BackupSchedule {
     async fn reconcile(&self, ctx: Arc<Context<Self>>) -> Result<Action> {
-        // 1. For each plan:
-        //   1. Find workloads based on selector & namespace_selector
-        //   2. Get PVCs tied to workloads
-        //   3. Filter PVCs based on pvc_selector
-        //   4. Add PVCs, and their related workload to list, this means last entry wins (if
-        //      multiple plans cover the same PVC)
-        // 2. For each PVC in list, create BackupJob
-
         // Monitor BackupSchedule
         // - Create BackupJobs, if immediately is true (default)
         // - Add entry to cron
         // Run cron
         // - Create BackupJobs
+
+        let backup_schedules: Api<BackupSchedule> =
+            Api::namespaced(ctx.client.clone(), self.namespace().as_ref().unwrap());
+
+        // Set initial status if none
+        let Some(status) = self.status.as_ref() else {
+            let _o = backup_schedules
+                .patch_status(
+                    &self.name_any(),
+                    &PatchParams::apply(WALLE),
+                    &Patch::Apply(json!({
+                        "apiVersion": "ros.io/v1",
+                        "kind": "BackupSchedule",
+                        "status": BackupScheduleStatus::default()
+                    })),
+                )
+                .await
+                .with_context(|_| KubeSnafu { msg: "Failed up update backupschedule status" })?;
+
+            return Ok(Action::requeue(Duration::ZERO));
+        };
 
         Ok(Action::requeue(Duration::from_secs(60 * 5)))
     }
@@ -140,6 +164,72 @@ impl BackupSchedule {
         //     warn!(?err, backup_job = ?self, "Failed to add deletion event to backupjob");
         // }
         Ok(Action::await_change())
+    }
+
+    // Find all matching workloads, and create backupjobs for them
+    pub async fn run(&self, client: &kube::Client) {
+        let mut pvcs = BTreeMap::new();
+        for plan in &self.spec.plans {
+            // TODO - Move body of loop into function and do better error handling
+
+            assert_eq!(plan.type_, "pod", "Currently only able to target pods");
+            let api: Api<Pod> = Api::all(client.clone());
+
+            let mut lp = ListParams::default();
+            if let Some(ref ls) = plan.label_selector {
+                lp = lp.labels(ls);
+            }
+            if let Some(ref fs) = plan.field_selector {
+                lp = lp.fields(fs);
+            }
+
+            let resources = api.list(&lp).await.unwrap();
+
+            // Get PVCs
+            for pod in resources {
+                let Some(volumes) = pod.spec.as_ref().and_then(|x| x.volumes.as_ref()) else {
+                    continue;
+                };
+                for volume in volumes {
+                    let Some(ref claim) = volume.persistent_volume_claim else { continue };
+                    let pvc_meta =
+                        (pod.meta().namespace.clone().unwrap(), claim.claim_name.clone());
+
+                    pvcs.insert(pvc_meta, plan);
+                }
+            }
+        }
+
+        let mut namespaced_jobs = BTreeMap::new();
+
+        for ((pvc_ns, pvc_name), plan) in pvcs {
+            let api = namespaced_jobs
+                .entry(pvc_ns)
+                .or_insert_with_key(|ns| Api::<BackupJob>::namespaced(client.clone(), ns));
+
+            api.create(
+                &PostParams::default(),
+                &serde_json::from_value(json!({
+                    "apiVersion": "ros.io/v1",
+                    "kind": "BackupJob",
+                    "metadata": {
+                        "generateName": format!("{}-{}", self.meta().name.as_ref().unwrap(), pvc_name),
+                        "ownerReferences": [self.controller_owner_ref(&())],
+                    },
+                    "spec": {
+                        "source_pvc": pvc_name,
+                        "repository": self.spec.repository,
+
+                        // TODO - Figure out how to run stuff in workload correctly
+                        // "before_snapshot": plan.before_snapshot,
+                        // "after_snapshot": plan.after_snapshot,
+                    }
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
     }
 }
 
@@ -270,15 +360,19 @@ pub async fn run_backup_schedules(client: Client, state: State) {
         .owns(backup_jobs, wc.clone())
         .shutdown_on_signal();
     let store = controller.store();
-    controller
-        .run(
-            reconcile_backup_schedule,
-            error_policy_backup_schedule,
-            state.to_context(client, store),
-        )
-        .filter_map(|x| async move { std::result::Result::ok(x) })
-        .for_each(|_| future::ready(()))
-        .await;
+    tokio::task::spawn(
+        controller
+            .run(
+                reconcile_backup_schedule,
+                error_policy_backup_schedule,
+                state.to_context(client.clone(), store.clone()),
+            )
+            .filter_map(|x| async move { std::result::Result::ok(x) })
+            .for_each(|_| future::ready(())),
+    );
+
+    let scheduler = Scheduler::new(store);
+    tokio::task::spawn(scheduler.run(client, state.diagnostics().await.reporter));
 }
 
 #[instrument(skip(ctx, backup_schedule), fields(trace_id))]

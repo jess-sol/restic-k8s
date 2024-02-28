@@ -194,7 +194,7 @@ impl BackupJob {
                         &Patch::Merge(json!({
                             "status": {
                                 "state": BackupJobState::BackingUp,
-                                "start_time": Some(snapshot_creation_time),
+                                "start_time": Some(snapshot_creation_time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),),
                                 "backup_job": Some(created_job.name_any()),
                             },
                         })),
@@ -268,7 +268,7 @@ impl BackupJob {
                                     },
                                     "backup_job": Option::<String>::None,
                                     "destination_snapshot": Option::<String>::None,
-                                    "finish_time": Some(Utc::now()),
+                                    "finish_time": Some(Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
                                 },
                             })),
                         )

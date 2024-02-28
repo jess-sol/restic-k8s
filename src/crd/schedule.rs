@@ -1,3 +1,6 @@
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -16,11 +19,10 @@ pub struct BackupScheduleSpec {
     /// See https://volsync.readthedocs.io/en/stable/usage/restic/index.html for details.
     pub repository: SecretRef,
 
-    pub interval: CronJobInterval,
-    pub prune_interval: CronJobInterval,
-    pub check_interval: CronJobInterval,
+    pub interval: Option<IntervalSpec>,
 
-    pub retain: RetentionSpec,
+    pub prune: Option<PruneJobSpec>,
+    pub check: Option<CheckJobSpec>,
 
     /// List of backup plans to run on schedule. The first to match a workload or PVC will be used,
     /// overriding any following plans.
@@ -28,43 +30,38 @@ pub struct BackupScheduleSpec {
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
-pub struct BackupPlanSpec {
-    /// Selects resources which should be backed up. May select Deployments, Statefulsets, PVCs,
-    /// etc.
-    pub selector: Vec<CombinatorSelector>,
+pub struct PruneJobSpec {
+    pub interval: IntervalSpec,
+    pub retain: RetentionSpec,
+}
 
+#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+pub struct CheckJobSpec {
+    pub interval: IntervalSpec,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+pub struct BackupPlanSpec {
+    /// Type of resource to select, may be any resource with Pod child resources
+    #[serde(rename = "type")]
+    pub type_: String,
+
+    /// See https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#label-selectors
+    pub label_selector: Option<String>,
+
+    /// See https://kubernetes.io/docs/concepts/overview/working-with-objects/field-selectors
+    pub field_selector: Option<String>,
+
+    // TODO - Namespace selector
     /// Any workload resources selected by `selector` will then have their PVCs filtered using this
     /// selector.
-    pub pvc_selector: Vec<CombinatorSelector>,
+    // pub pvc_selector: Vec<Selector>,
 
     /// Run in the pod a PVC is mounted to before a snapshot is taken of the PVC
-    pub before_snapshot: String,
+    pub before_snapshot: Option<String>,
 
     /// Run in the pod a PVC is mounted to after a snapshot is taken of the PVC
-    pub after_snapshot: String,
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
-pub enum CombinatorSelector {
-    // If left blank will match any resource
-    Any(Vec<UnarySelector>),
-    // If left blank will match any resource
-    All(Vec<UnarySelector>),
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
-pub enum UnarySelector {
-    Has(WorkloadSelector),
-    Not(WorkloadSelector),
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
-pub enum WorkloadSelector {
-    Name(String),
-    NameMatching(String),
-    Label { name: String, value: String },
-    Annotation { name: String, value: String },
-    Type(String),
+    pub after_snapshot: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
@@ -76,10 +73,42 @@ pub struct RetentionSpec {
     pub yearly: u32,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 pub struct BackupScheduleStatus {
-    pub condition: String,
+    // pub condition: String,
+    pub last_backup_run: Option<String>,
+    pub last_check_run: Option<String>,
+    pub last_prune_run: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
-pub struct CronJobInterval(String);
+pub struct IntervalSpec(pub String);
+
+impl IntervalSpec {
+    pub fn passed_interval(&self, last_run: &DateTime<Utc>) -> bool {
+        Utc::now() > *last_run + self.as_duration()
+    }
+
+    // TODO - Error handling
+    pub fn as_duration(&self) -> Duration {
+        let mut duration = Duration::new(0, 0);
+        let mut buffer = String::with_capacity(5);
+        for char in self.0.chars() {
+            if char.is_ascii_digit() {
+                buffer.push(char);
+            } else {
+                let digits: u64 = buffer.parse().expect("Unable to parse interval value");
+                match char {
+                    's' => duration += Duration::from_secs(digits),
+                    'm' => duration += Duration::from_secs(digits * 60),
+                    'h' => duration += Duration::from_secs(digits * 60 * 60),
+                    'd' => duration += Duration::from_secs(digits * 60 * 60 * 24),
+                    'w' => duration += Duration::from_secs(digits * 60 * 60 * 24 * 7),
+                    _ => panic!("Unable to parse interval"),
+                }
+            }
+        }
+
+        duration
+    }
+}

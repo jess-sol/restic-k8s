@@ -1,0 +1,14 @@
+---
+apiVersion: ros.io/v1
+kind: BackupSchedule
+metadata:
+  name: example-backup-schedule
+spec:
+  interval: 60s
+  plans:
+  - type: pod
+    label_selector: app=test
+    field_selector: metadata.namespace=default
+  repository:
+    name: restic-rest-config 
+    namespace: default

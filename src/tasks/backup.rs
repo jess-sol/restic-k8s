@@ -198,7 +198,7 @@ pub async fn create_backup_job(
                 "labels": {
                     "app.kubernetes.io/created-by": WALLE,
                 },
-                "ownerReferences": backup_job.controller_owner_ref(&()).unwrap(),
+                "ownerReferences": [backup_job.controller_owner_ref(&()).unwrap()],
             },
             "spec": {
                 "template": {
@@ -209,12 +209,12 @@ pub async fn create_backup_job(
                             "name": "restic",
                             "image": &settings.backup_job_image,
                             "imagePullPolicy": "Always",
-                            "args": "backup",
+                            "args": ["backup"],
                             "env": [
                                 // { "name": "RUST_BACKTRACE", "value": "full".to_string() },
                                 // { "name": "RUST_LOG", "value": "trace".to_string() },
 
-                                { "name": "REPOSITORY_SECRET", "value": backup_job.spec.repository },
+                                { "name": "REPOSITORY_SECRET", "value": backup_job.spec.repository.to_string() },
                                 { "name": "OPERATOR_NAMESPACE", "value": &operator_namespace },
                                 { "name": "K8S_CLUSTER_NAME", "value": settings.cluster_name },
                                 { "name": "TRACE_ID", "value": crate::telemetry::get_trace_id().to_string() },
