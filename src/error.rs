@@ -17,6 +17,14 @@ pub enum AppError {
 
     #[snafu(display("InvalidPVC"))]
     InvalidPVC,
+
+    #[snafu(whatever, display("{message}"))]
+    Whatever {
+        message: String,
+        #[snafu(source(from(Box<dyn std::error::Error + Send + Sync>, Some)))]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+        backtrace: snafu::Backtrace,
+    },
 }
 
 impl AppError {

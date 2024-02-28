@@ -59,7 +59,10 @@ impl BackupJob {
         let job_name = status.backup_job.as_deref();
 
         let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &ns);
-        let Some(pvc) = pvcs.get_opt(&self.spec.source_pvc).await.unwrap() else {
+        let Some(pvc) = pvcs.get_opt(&self.spec.source_pvc).await.with_whatever_context(|_| {
+            format!("Unable to fetch sourcePvc for backupjob {}/{}", ns, name)
+        })?
+        else {
             recorder
                 .publish(Event {
                     type_: EventType::Warning,
@@ -72,6 +75,7 @@ impl BackupJob {
                 .with_context(|_| KubeSnafu { msg: "Unable to send event for backupjob" })?;
             return Ok(Action::requeue(Duration::from_secs(30)));
         };
+
         let pvc_spec = pvc.spec.as_ref().with_context(|| InvalidPVCSnafu)?;
         let storage_class =
             pvc_spec.storage_class_name.as_ref().with_context(|| InvalidPVCSnafu)?;
@@ -90,7 +94,9 @@ impl BackupJob {
         //         .unwrap();
         // println!("{:?}", apigroup.recommended_kind("VolumeSnapshot"));
         let gvk = GroupVersionKind::gvk("snapshot.storage.k8s.io", "v1", "VolumeSnapshot");
-        let (ar, _caps) = kube::discovery::pinned_kind(&client, &gvk).await.unwrap();
+        let (ar, _caps) = kube::discovery::pinned_kind(&client, &gvk)
+            .await
+            .whatever_context("Failed to get VolumeSnapshot kind for k8s API")?;
         let snapshots = Api::<DynamicObject>::namespaced_with(client.clone(), &ns, &ar);
 
         match status.state {
@@ -116,7 +122,12 @@ impl BackupJob {
                                 }
                             }
                         }))
-                        .unwrap(),
+                        .with_whatever_context(|_| {
+                            format!(
+                                "Failed to parse predefined VolumeSnapshot for BackupJob {}/{}",
+                                ns, name,
+                            )
+                        })?,
                     )
                     .await
                     .with_context(|_| KubeSnafu {
@@ -138,13 +149,10 @@ impl BackupJob {
                     .with_context(|_| KubeSnafu { msg: "Failed up update backupjob status" })?;
             }
             BackupJobState::CreatingSnapshot => {
-                let snapshot =
-                    snapshots.get(snapshot_name.unwrap()).await.with_context(|_| KubeSnafu {
-                        msg: format!(
-                            "Unable to get referenced snapshot: {}",
-                            snapshot_name.unwrap_or("<No snapshot name>")
-                        ),
-                    })?;
+                let snapshot_name = snapshot_name.with_whatever_context(|| format!("BackupJob {}/{} in CreatingSnapshot state without status.destinationSnapshot set", ns, name))?;
+                let snapshot = snapshots.get(snapshot_name).await.with_context(|_| KubeSnafu {
+                    msg: format!("Unable to get referenced snapshot: {}", snapshot_name),
+                })?;
 
                 let Some(snapshot_status) = snapshot.data.get("status") else {
                     return Ok(Action::requeue(Duration::from_secs(5)));
