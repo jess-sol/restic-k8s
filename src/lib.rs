@@ -164,17 +164,95 @@ impl Diagnostics {
 }
 
 struct Scheduler {
-    schedules: Store<BackupSchedule>,
+    store: Store<BackupSchedule>,
+}
+
+impl Scheduler {
+    pub fn new(store: Store<BackupSchedule>) -> Self {
+        Self { store }
+    }
+
+    /// Loop through schedules and run on cron schedule
+    pub async fn run(self, client: Client, reporter: Reporter) {
+        let since_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Unable to calculate time since epoch");
+        let offset = Duration::from_micros(
+            (since_epoch.as_micros() % Duration::from_secs(1).as_micros()) as u64,
+        );
+        // Get start time on whole second of system clock
+        let start = Instant::now().sub(offset);
+
+        loop {
+            debug!("Checking for backup schedules to run");
+            // Check if any schedules have a matching cron, if they do, kick them off
+            while let Some(schedule) = self.store.find(|schedule| {
+                schedule
+                    .status
+                    .as_ref()
+                    .and_then(|x| x.last_backup_run.as_ref())
+                    .map(|x| {
+                        schedule
+                            .spec
+                            .interval
+                            .as_ref()
+                            .map(|int| {
+                                int.passed_interval(
+                                    &DateTime::parse_from_rfc3339(x).unwrap().to_utc(),
+                                )
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(true)
+            }) {
+                info!(name = schedule.name_any(), "Starting backup schedule job");
+                let schedules: Api<BackupSchedule> =
+                    Api::namespaced(client.clone(), schedule.meta().namespace.as_ref().unwrap());
+                let recorder =
+                    Recorder::new(client.clone(), reporter.clone(), schedule.object_ref(&()));
+                let _ = recorder
+                    .publish(Event {
+                        type_: EventType::Normal,
+                        reason: "RunningBackup".into(),
+                        note: Some("Beginning scheduled backup".into()),
+                        action: "Backup".into(),
+                        secondary: None,
+                    })
+                    .await;
+
+                let _o = schedules
+                    .patch_status(
+                        &schedule.name_any(),
+                        &PatchParams::apply(WALLE),
+                        &Patch::Apply(json!({
+                            "apiVersion": "ros.io/v1",
+                            "kind": "BackupSchedule",
+                            "status": {
+                                "last_backup_run": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            }
+                        })),
+                    )
+                    .await
+                    .expect("Unable to set last_backup_run for backup schedule");
+
+                schedule.run(&client).await;
+            }
+
+            // Sleep until next full second since start
+            let run_delta = Instant::now().duration_since(start);
+            let offset = Duration::from_millis(1000 - (run_delta.as_millis() % 1000) as u64);
+            tokio::time::sleep(offset).await;
+        }
+    }
 }
 
 /// Initialize the controller and shared state (given the crd is installed)
 pub async fn run(state: State) {
     let client = Client::try_default().await.expect("failed to create kube Client");
 
-    tokio::join!(
-        run_backup_jobs(client.clone(), state.clone()),
-        run_backup_schedules(client, state)
-    );
+    let jobs = tokio::task::spawn(run_backup_jobs(client.clone(), state.clone()));
+    let schedule = tokio::task::spawn(run_backup_schedules(client, state));
+    let _ = join!(jobs, schedule);
 }
 
 pub async fn run_backup_schedules(client: Client, state: State) {
