@@ -6,12 +6,10 @@
 workflow:
   auto_cancel:
     on_new_commit: interruptible
-  # rules:
-  # - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-  #   when: never
-  # - if: '$CI_COMMIT_TAG'
-  #   when: never
-  # - when: always
+  rules:
+  - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    when: never
+  - when: always
 
 image: "rust:1"
 
@@ -40,7 +38,7 @@ test:clippy:
   script:
   - rustup component add clippy
   - cargo clippy
-  - sleep 600
+
 
 # test:cargo:
 #   stage: build
@@ -59,7 +57,6 @@ test:clippy:
 #   script:
 #   - cargo run --bin kubia-server task migrate
 #   - cargo test --workspace --verbose
-
 
 # test:coverage:
 #   extends: test:cargo
