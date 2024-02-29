@@ -35,7 +35,7 @@ impl BackupSchedule {
             Api::namespaced(ctx.kube.client(), self.namespace().as_ref().unwrap());
 
         // Set initial status if none
-        let Some(status) = self.status.as_ref() else {
+        let Some(_status) = self.status.as_ref() else {
             let _o = backup_schedules
                 .patch_status(
                     &self.name_any(),

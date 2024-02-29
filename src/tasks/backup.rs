@@ -20,12 +20,11 @@ use std::time::Duration;
 
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{DeleteParams, ListParams, LogParams, PropagationPolicy};
-use kube::core::{DynamicObject, GroupVersionKind};
+use kube::core::DynamicObject;
 use kube::runtime::events::{Event, EventType};
-use snafu::{OptionExt as _, ResultExt as _};
 
 use kube::runtime::controller::Action;
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::crd::{BackupJobState, BackupJobStatus};
 use crate::Context;
@@ -172,13 +171,17 @@ impl BackupJob {
                             .expect("Unable to get default repository secret namespace")
                     });
 
-                ensure_rbac(
+                if let Err(err) = ensure_rbac(
                     &ctx.kube.client(),
-                    ns,
-                    self.spec.repository.name.clone(),
-                    operator_namespace.clone(),
+                    &ns,
+                    &self.spec.repository.name,
+                    &operator_namespace,
                 )
-                .await;
+                .await
+                {
+                    error!(name, ns, ?err, "Unable to configure rbac to create backup job");
+                    return Ok(Action::requeue(Duration::from_secs(60)));
+                }
 
                 let created_job = create_backup_job(
                     self,
@@ -232,7 +235,9 @@ impl BackupJob {
                 let failed = job.status.as_ref().map(|x| x.failed.unwrap_or(0)).unwrap_or(0);
 
                 if succeeded > 0 || failed >= 5 {
-                    cleanup_backup_job(&ctx, &self).await.unwrap();
+                    if let Err(err) = cleanup_backup_job(&ctx, self).await {
+                        error!(name, ns, ?err, "Failed to cleanup BackupJob after finished/failed");
+                    }
 
                     let is_success = succeeded > 0;
 
@@ -302,14 +307,10 @@ impl BackupJob {
 }
 
 async fn cleanup_backup_job(ctx: &Context<BackupJob>, job: &BackupJob) -> Result<()> {
-    let gvk = GroupVersionKind::gvk("snapshot.storage.k8s.io", "v1", "VolumeSnapshot");
-    let (snapshot_ar, _caps) = kube::discovery::pinned_kind(&ctx.kube.client(), &gvk)
-        .await
-        .whatever_context("Failed to get VolumeSnapshot kind for k8s API")?;
     let snapshots = Api::<DynamicObject>::namespaced_with(
         ctx.kube.client(),
         &job.namespace().unwrap(),
-        &snapshot_ar,
+        &ctx.kube.snapshot_ar,
     );
 
     let snapshot_name = job.status.as_ref().and_then(|x| x.destination_snapshot.as_deref());
@@ -344,18 +345,16 @@ async fn latest_logs_of_job(
     let pods: Api<Pod> = Api::default_namespaced(client);
     let matching_pods = pods
         .list(&ListParams::default().labels(&format!("controller-uid={}", job.uid().unwrap())))
-        .await
-        .unwrap();
+        .await?;
     let latest_pod = matching_pods
         .items
         .into_iter()
         .max_by(|x, y| x.creation_timestamp().cmp(&y.creation_timestamp()));
 
-    if let Some(latest_pod) = latest_pod {
-        Ok(Some(pods.logs(&latest_pod.name_any(), &LogParams::default()).await?))
-    } else {
-        Ok(None)
-    }
+    Ok(match latest_pod {
+        Some(pod) => Some(pods.logs(&pod.name_any(), &LogParams::default()).await?),
+        None => None,
+    })
 }
 
 fn recover_block_in_string<'a>(
@@ -370,75 +369,74 @@ fn recover_block_in_string<'a>(
 /// when created with the provided service account in the provided namespace.
 /// Namely access to the repository_secret reference.
 pub async fn ensure_rbac(
-    client: &kube::Client, namespace: String, repository_secret: String,
-    repository_secret_ns: String,
-) {
-    let secrets: Api<Secret> = Api::namespaced(client.clone(), &repository_secret_ns);
-    let secret = secrets.get(&repository_secret).await.unwrap();
+    client: &kube::Client, namespace: &str, repository_secret: &str, repository_secret_ns: &str,
+) -> Result<(), kube::Error> {
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), repository_secret_ns);
+    let secret = secrets.get(repository_secret).await?;
 
     // 1. Create serviceaccount/walle-worker in the backup job namespace
-    let service_accounts: Api<ServiceAccount> = Api::namespaced(client.clone(), &namespace);
+    let service_accounts: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
 
-    let service_account = if let Some(sa) = service_accounts.get_opt("walle-worker").await.unwrap()
-    {
-        sa
-    } else {
-        service_accounts
-            .create(
-                &PostParams::default(),
-                &serde_json::from_value(json!({
-                    "apiVersion": "v1",
-                    "kind": "ServiceAccount",
-                    "metadata": {
-                        "name": "walle-worker",
-                        // TODO - Add helm labels
-                    }
-                }))
-                .expect("Invalid predefined service account json"),
-            )
-            .await
-            .unwrap()
+    let service_account = match service_accounts.get_opt("walle-worker").await? {
+        Some(sa) => sa,
+        None => {
+            service_accounts
+                .create(
+                    &PostParams::default(),
+                    &serde_json::from_value(json!({
+                        "apiVersion": "v1",
+                        "kind": "ServiceAccount",
+                        "metadata": {
+                            "name": "walle-worker",
+                            // TODO - Add helm labels
+                        }
+                    }))
+                    .expect("Invalid predefined service account json"),
+                )
+                .await?
+        }
     };
 
     // 2. Create clusterrole
     let cluster_roles: Api<ClusterRole> = Api::all(client.clone());
 
     let role_name = format!("walle-read-{}", repository_secret);
-    let cluster_role = if let Some(role) = cluster_roles.get_opt(&role_name).await.unwrap() {
-        role
-    } else {
-        cluster_roles
-            .create(
-                &PostParams::default(),
-                &serde_json::from_value(json!({
-                    "apiVersion": "rbac.authorization.k8s.io/v1",
-                    "kind": "ClusterRole",
-                    "metadata": {
-                        "name": role_name,
-                        "ownerReferences": [secret.controller_owner_ref(&())],
-                    },
-                    "rules": [{
-                        "apiGroups": [""],
-                        "resources": ["secrets"],
-                        "resourceNames": [repository_secret],
-                        "verbs": ["get"],
-                    }],
-                }))
-                .expect("Invalid predefined cluster role json"),
-            )
-            .await
-            .unwrap()
+
+    let cluster_role = match cluster_roles.get_opt(&role_name).await? {
+        Some(role) => role,
+        None => {
+            cluster_roles
+                .create(
+                    &PostParams::default(),
+                    &serde_json::from_value(json!({
+                        "apiVersion": "rbac.authorization.k8s.io/v1",
+                        "kind": "ClusterRole",
+                        "metadata": {
+                            "name": role_name,
+                            "ownerReferences": [secret.controller_owner_ref(&())],
+                        },
+                        "rules": [{
+                            "apiGroups": [""],
+                            "resources": ["secrets"],
+                            "resourceNames": [repository_secret],
+                            "verbs": ["get"],
+                        }],
+                    }))
+                    .expect("Invalid predefined cluster role json"),
+                )
+                .await?
+        }
     };
 
     // 3. Create or update rolebinding in secret_ns
-    let role_bindings: Api<RoleBinding> = Api::namespaced(client.clone(), &repository_secret_ns);
+    let role_bindings: Api<RoleBinding> = Api::namespaced(client.clone(), repository_secret_ns);
 
     let binding_name = format!("walle-read-{}", repository_secret);
-    let role_binding =
-        if let Some(_role_binding) = role_bindings.get_opt(&binding_name).await.unwrap() {
+    let _role_binding = match role_bindings.get_opt(&binding_name).await? {
+        Some(existing_binding) => {
             role_bindings
                 .patch(
-                    &binding_name,
+                    &existing_binding.name_any(),
                     &PatchParams::apply(WALLE),
                     &Patch::Merge(json!({
                         "subjects": [{
@@ -448,9 +446,9 @@ pub async fn ensure_rbac(
                         }]
                     })),
                 )
-                .await
-                .unwrap()
-        } else {
+                .await?
+        }
+        None => {
             role_bindings
                 .create(
                     &PostParams::default(),
@@ -474,9 +472,11 @@ pub async fn ensure_rbac(
                     }))
                     .expect("Invalid predefined cluster role json"),
                 )
-                .await
-                .unwrap()
-        };
+                .await?
+        }
+    };
+
+    Ok(())
 }
 
 pub async fn create_backup_job(
@@ -484,13 +484,20 @@ pub async fn create_backup_job(
     operator_namespace: String, settings: &AppConfig, client: &Client,
 ) -> Result<Job> {
     let name = format!("{WALLE}-{}-", backup_job.spec.source_pvc);
-    let namespace = backup_job.namespace().unwrap();
+    let namespace = backup_job.namespace().whatever_context(
+        "Unable to get namespace of existing backup_job, this shouldn't happen.",
+    )?;
 
     let jobs: Api<Job> = Api::namespaced(client.clone(), &namespace);
     let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &namespace);
 
-    let snapshot_name =
-        backup_job.status.as_ref().and_then(|x| x.destination_snapshot.as_deref()).unwrap();
+    let snapshot_name = backup_job
+        .status
+        .as_ref()
+        .and_then(|x| x.destination_snapshot.as_deref())
+        .whatever_context(
+            "No destinationSnapshot specified, but trying to create Job, status state inconsistent.",
+        )?;
 
     let storage_class = pvc
         .spec
