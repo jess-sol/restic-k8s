@@ -32,7 +32,7 @@ impl BackupSchedule {
         // - Create BackupJobs
 
         let backup_schedules: Api<BackupSchedule> =
-            Api::namespaced(ctx.client.clone(), self.namespace().as_ref().unwrap());
+            Api::namespaced(ctx.kube.client(), self.namespace().as_ref().unwrap());
 
         // Set initial status if none
         let Some(status) = self.status.as_ref() else {

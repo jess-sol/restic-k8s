@@ -32,11 +32,10 @@ use crate::Context;
 
 impl BackupJob {
     pub async fn reconcile(&self, ctx: Arc<Context<Self>>) -> Result<Action> {
-        let client = ctx.client.clone();
-        let recorder = ctx.diagnostics.read().await.recorder(client.clone(), self);
+        let recorder = ctx.diagnostics.read().await.recorder(ctx.kube.client(), self);
         let ns = self.namespace().unwrap();
         let name = self.name_any();
-        let backup_jobs: Api<BackupJob> = Api::namespaced(client.clone(), &ns);
+        let backup_jobs: Api<BackupJob> = Api::namespaced(ctx.kube.client(), &ns);
         let ps = PatchParams::apply(WALLE);
 
         // Set initial status if none
@@ -58,7 +57,7 @@ impl BackupJob {
         let snapshot_name = status.destination_snapshot.as_deref();
         let job_name = status.backup_job.as_deref();
 
-        let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &ns);
+        let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(ctx.kube.client(), &ns);
         let Some(pvc) = pvcs.get_opt(&self.spec.source_pvc).await.with_whatever_context(|_| {
             format!("Unable to fetch sourcePvc for backupjob {}/{}", ns, name)
         })?
@@ -87,17 +86,8 @@ impl BackupJob {
             .find(|x| x.storage_class == *storage_class)
             .map(|x| &x.snapshot_class);
 
-        // TODO - Support v1 and v1beta1
-        // let apigroup =
-        //     kube::discovery::pinned_group(&client, &GroupVersion::gv("snapshot.storage.k8s.io", "v1"))
-        //         .await
-        //         .unwrap();
-        // println!("{:?}", apigroup.recommended_kind("VolumeSnapshot"));
-        let gvk = GroupVersionKind::gvk("snapshot.storage.k8s.io", "v1", "VolumeSnapshot");
-        let (ar, _caps) = kube::discovery::pinned_kind(&client, &gvk)
-            .await
-            .whatever_context("Failed to get VolumeSnapshot kind for k8s API")?;
-        let snapshots = Api::<DynamicObject>::namespaced_with(client.clone(), &ns, &ar);
+        let snapshots =
+            Api::<DynamicObject>::namespaced_with(ctx.kube.client(), &ns, &ctx.kube.snapshot_ar);
 
         match status.state {
             BackupJobState::NotStarted => {
@@ -182,9 +172,8 @@ impl BackupJob {
                             .expect("Unable to get default repository secret namespace")
                     });
 
-                let client = kube::Client::try_default().await.unwrap();
                 ensure_rbac(
-                    &client,
+                    &ctx.kube.client(),
                     ns,
                     self.spec.repository.name.clone(),
                     operator_namespace.clone(),
@@ -197,7 +186,7 @@ impl BackupJob {
                     &snapshot_creation_time,
                     operator_namespace,
                     &ctx.config,
-                    &client,
+                    &ctx.kube.client(),
                 )
                 .await
                 .unwrap();
@@ -219,7 +208,7 @@ impl BackupJob {
             }
 
             BackupJobState::BackingUp => {
-                let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+                let jobs: Api<Job> = Api::namespaced(ctx.kube.client(), &ns);
                 let Some(job) = jobs
                     .get_opt(job_name.unwrap())
                     .await
@@ -230,7 +219,7 @@ impl BackupJob {
                 };
 
                 // Fetch logs of latest job to add to completion event
-                let logs = latest_logs_of_job(client.clone(), &job).await.unwrap();
+                let logs = latest_logs_of_job(ctx.kube.client(), &job).await.unwrap();
                 let logs = logs.as_deref().and_then(|logs| {
                     recover_block_in_string(
                         logs,
@@ -243,30 +232,7 @@ impl BackupJob {
                 let failed = job.status.as_ref().map(|x| x.failed.unwrap_or(0)).unwrap_or(0);
 
                 if succeeded > 0 || failed >= 5 {
-                    // Cleanup
-                    if let Some(job_name) = job_name {
-                        let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
-                        let _job = jobs
-                            .delete(
-                                job_name,
-                                &DeleteParams {
-                                    propagation_policy: Some(PropagationPolicy::Foreground),
-                                    ..Default::default()
-                                },
-                            )
-                            .await
-                            .with_context(|_| KubeSnafu {
-                                msg: "Failed to cleanup job associated with backupjob",
-                            });
-                    }
-                    if let Some(snapshot_name) = snapshot_name {
-                        let _ss = snapshots
-                            .delete(snapshot_name, &DeleteParams::default())
-                            .await
-                            .with_context(|_| KubeSnafu {
-                                msg: "Failed to cleanup snapshot associated with backupjob",
-                            });
-                    }
+                    cleanup_backup_job(&ctx, &self).await.unwrap();
 
                     let is_success = succeeded > 0;
 
@@ -316,7 +282,7 @@ impl BackupJob {
 
     // Finalizer cleanup (the object was deleted, ensure nothing is orphaned)
     pub async fn cleanup(&self, ctx: Arc<Context<Self>>) -> Result<Action> {
-        let recorder = ctx.diagnostics.read().await.recorder(ctx.client.clone(), self);
+        let recorder = ctx.diagnostics.read().await.recorder(ctx.kube.client(), self);
         let result = recorder
             .publish(Event {
                 type_: EventType::Normal,
@@ -333,6 +299,43 @@ impl BackupJob {
         }
         Ok(Action::await_change())
     }
+}
+
+async fn cleanup_backup_job(ctx: &Context<BackupJob>, job: &BackupJob) -> Result<()> {
+    let gvk = GroupVersionKind::gvk("snapshot.storage.k8s.io", "v1", "VolumeSnapshot");
+    let (snapshot_ar, _caps) = kube::discovery::pinned_kind(&ctx.kube.client(), &gvk)
+        .await
+        .whatever_context("Failed to get VolumeSnapshot kind for k8s API")?;
+    let snapshots = Api::<DynamicObject>::namespaced_with(
+        ctx.kube.client(),
+        &job.namespace().unwrap(),
+        &snapshot_ar,
+    );
+
+    let snapshot_name = job.status.as_ref().and_then(|x| x.destination_snapshot.as_deref());
+    let job_name = job.status.as_ref().and_then(|x| x.backup_job.as_deref());
+
+    if let Some(job_name) = job_name {
+        let jobs: Api<Job> = Api::namespaced(ctx.kube.client(), &job.namespace().unwrap());
+        let _job = jobs
+            .delete(
+                job_name,
+                &DeleteParams {
+                    propagation_policy: Some(PropagationPolicy::Foreground),
+                    ..Default::default()
+                },
+            )
+            .await
+            .with_context(|_| KubeSnafu { msg: "Failed to cleanup job associated with backupjob" });
+    }
+    if let Some(snapshot_name) = snapshot_name {
+        let _ss =
+            snapshots.delete(snapshot_name, &DeleteParams::default()).await.with_context(|_| {
+                KubeSnafu { msg: "Failed to cleanup snapshot associated with backupjob" }
+            });
+    }
+
+    Ok(())
 }
 
 async fn latest_logs_of_job(

@@ -1,24 +1,17 @@
 use config::AppConfig;
 use futures::StreamExt;
 use k8s_openapi::api::batch::v1::Job;
-use serde_json::json;
-use std::{
-    future,
-    hash::Hash,
-    ops::Sub,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
-use tasks::schedule::Scheduler;
+use std::{future, hash::Hash, sync::Arc, time::Duration};
+use tasks::{schedule::Scheduler, KubeManager};
 
 use chrono::{DateTime, Utc};
 use crd::{BackupJob, BackupSchedule};
 use kube::{
-    api::{ListParams, Patch, PatchParams},
+    api::ListParams,
     core::{DynamicObject, GroupVersionKind},
     runtime::{
         controller::Action,
-        events::{Event, EventType, Recorder, Reporter},
+        events::{Recorder, Reporter},
         finalizer::finalizer,
         finalizer::Event as FinalizerEvent,
         reflector::Store,
@@ -28,8 +21,8 @@ use kube::{
 };
 use serde::Serialize;
 use snafu::ResultExt as _;
-use tokio::{join, sync::RwLock, time::Instant};
-use tracing::{debug, error, field, info, instrument, warn, Span};
+use tokio::{join, sync::RwLock};
+use tracing::{error, field, info, instrument, warn, Span};
 
 pub mod config;
 pub mod crd;
@@ -78,13 +71,13 @@ impl State {
 
     // Create a Controller Context that can update State
     pub fn to_context<T: Clone + Resource + 'static>(
-        &self, client: Client, store: Store<T>,
+        &self, kube: KubeManager, store: Store<T>,
     ) -> Arc<Context<T>>
     where
         T::DynamicType: Eq + Hash,
     {
         Arc::new(Context {
-            client,
+            kube,
             config: self.config.clone(),
             // metrics: Metrics::default().register(&self.registry).unwrap(),
             diagnostics: self.diagnostics.clone(),
@@ -100,7 +93,7 @@ where
     T::DynamicType: Eq + Hash,
 {
     /// Kubernetes client
-    pub client: Client,
+    pub kube: KubeManager,
     /// Diagnostics read by the web server
     pub diagnostics: Arc<RwLock<Diagnostics>>,
     /// Prometheus metrics
@@ -151,6 +144,8 @@ pub async fn run_backup_schedules(client: Client, state: State) {
     let wc = watcher::Config::default().any_semantic();
     let backup_jobs = Api::<BackupJob>::all(client.clone());
 
+    let kube_manager = KubeManager::new(client.clone()).await.unwrap();
+
     let controller = Controller::new(backup_schedules, wc.clone())
         .owns(backup_jobs, wc.clone())
         .shutdown_on_signal();
@@ -160,7 +155,7 @@ pub async fn run_backup_schedules(client: Client, state: State) {
             .run(
                 reconcile_backup_schedule,
                 error_policy_backup_schedule,
-                state.to_context(client.clone(), store.clone()),
+                state.to_context(kube_manager, store.clone()),
             )
             .filter_map(|x| async move { std::result::Result::ok(x) })
             .for_each(|_| future::ready(())),
@@ -179,7 +174,7 @@ async fn reconcile_backup_schedule(
     // let _timer = ctx.metrics.count_and_measure();
     ctx.diagnostics.write().await.last_event = Utc::now();
     let ns = backup_schedule.namespace().unwrap(); // doc is namespace scoped
-    let backup_schedules: Api<BackupSchedule> = Api::namespaced(ctx.client.clone(), &ns);
+    let backup_schedules: Api<BackupSchedule> = Api::namespaced(ctx.kube.client(), &ns);
 
     info!("Reconciling Document \"{}\" in {}", backup_schedule.name_any(), ns);
     finalizer(&backup_schedules, BACKUP_JOB_FINALIZER, backup_schedule, |event| async {
@@ -213,7 +208,9 @@ pub async fn run_backup_jobs(client: Client, state: State) {
 
     let gvk = GroupVersionKind::gvk("snapshot.storage.k8s.io", "v1", "VolumeSnapshot");
     let (snapshot_ar, _caps) = kube::discovery::pinned_kind(&client, &gvk).await.unwrap();
-    let snapshots = Api::<DynamicObject>::all_with(client.clone(), &snapshot_ar);
+    let kube_manager = KubeManager::new(client).await.unwrap();
+    let snapshots =
+        Api::<DynamicObject>::all_with(kube_manager.client(), &kube_manager.snapshot_ar);
 
     let controller = Controller::new(backup_jobs, wc.clone())
         .owns(jobs, wc.clone())
@@ -221,7 +218,7 @@ pub async fn run_backup_jobs(client: Client, state: State) {
         .shutdown_on_signal();
     let store = controller.store();
     controller
-        .run(reconcile_backup_job, error_policy, state.to_context(client, store))
+        .run(reconcile_backup_job, error_policy, state.to_context(kube_manager, store))
         .filter_map(|x| async move { std::result::Result::ok(x) })
         .for_each(|_| future::ready(()))
         .await;
@@ -236,7 +233,7 @@ async fn reconcile_backup_job(
     // let _timer = ctx.metrics.count_and_measure();
     ctx.diagnostics.write().await.last_event = Utc::now();
     let ns = backup_job.namespace().unwrap(); // doc is namespace scoped
-    let backup_jobs: Api<BackupJob> = Api::namespaced(ctx.client.clone(), &ns);
+    let backup_jobs: Api<BackupJob> = Api::namespaced(ctx.kube.client(), &ns);
 
     info!("Reconciling Document \"{}\" in {}", backup_job.name_any(), ns);
     finalizer(&backup_jobs, BACKUP_JOB_FINALIZER, backup_job, |event| async {
