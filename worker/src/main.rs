@@ -121,6 +121,7 @@ fn do_backup(
         get_repository_secret(client, operator_namespace, repository_secret).await
     });
 
+    println!("<<<<<<<<<< START OUTPUT");
     info!(
         "Backing up to {}, on host {}, with tags {},{}, at time {}",
         repo_env_vars.get("RESTIC_REPOSITORY").map_or("<unset repository>", String::deref),
@@ -131,7 +132,11 @@ fn do_backup(
     );
     debug!("Starting restic {}", restic_path);
 
-    println!("<<<<<<<<<< START OUTPUT");
+    if repo_env_vars.get("INITIALIZE_REPO").map(|x| is_truthy(x.as_str())).unwrap_or(false) {
+        info!("Ensuring repository is initialized");
+        initialize_repository(&restic_path, &repo_env_vars)?;
+    }
+
     let mut process = Command::new(restic_path)
         .args([
             "backup",
@@ -191,7 +196,39 @@ impl ResticExitCodes {
     }
 }
 
-fn initialize_repository() {}
+fn initialize_repository(
+    restic_path: &str, repo_env_vars: &BTreeMap<String, String>,
+) -> Result<()> {
+    let result = Command::new(restic_path)
+        .args(["list", "snapshots"])
+        .envs(repo_env_vars)
+        .output()
+        .with_context(|_| ProcessSpawnSnafu)?;
+
+    let stdout = String::from_utf8_lossy(result.stdout.as_slice()).to_string();
+    let stderr = String::from_utf8_lossy(result.stderr.as_slice()).to_string();
+
+    debug!(stderr, stdout, result=?result.status, "test output");
+
+    if result.status.code() == Some(1)
+        && String::from_utf8_lossy(result.stderr.as_slice())
+            .contains("Is there a repository at the following location?")
+    {
+        info!("Initializing repository...");
+        let mut process = Command::new(restic_path)
+            .args(["init"])
+            .envs(repo_env_vars)
+            .spawn()
+            .with_context(|_| ProcessSpawnSnafu)?;
+
+        let result = process.wait().context(ProcessIOSnafu)?;
+        if result.code() != Some(0) {
+            InitializeRepoSnafu.fail()?;
+        }
+    }
+
+    Ok(())
+}
 
 async fn get_repository_secret(
     client: kube::Client, operator_namespace: Option<String>, resource_secret: String,
@@ -244,6 +281,8 @@ enum BackupError {
         #[snafu(backtrace)]
         backtrace: Backtrace,
     },
+    #[snafu(display("Failed to initialize repository"))]
+    InitializeRepoError,
     #[snafu(display("restic failed with exit code: {exit_code:?}"))]
     BackupFailed { exit_code: Option<ExitCode> },
 }
@@ -257,4 +296,12 @@ fn do_check() -> Result<()> {
 
 fn do_purge() -> Result<()> {
     Ok(())
+}
+
+fn is_truthy(value: &str) -> bool {
+    match value.to_lowercase().as_str() {
+        "yes" | "true" | "1" => true,
+        "no" | "false" | "0" => false,
+        _ => false,
+    }
 }
