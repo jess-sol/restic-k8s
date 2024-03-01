@@ -8,7 +8,7 @@ use kube::{
 };
 
 use crate::{
-    crd::{BackupScheduleState, BackupSetState},
+    crd::{BackupScheduleState, BackupSetState, FieldOperator, FieldSelector},
     WALLE,
 };
 
@@ -95,6 +95,18 @@ pub fn label_selector_to_filter(selector: &LabelSelector) -> String {
                 "DoesNotExist" => result.push(format!("!{key}")),
                 x => unreachable!("Invalid operator provided in label selector {}", x),
             }
+        }
+    }
+
+    result.join(",")
+}
+
+pub fn field_selector_to_filter(selectors: &Vec<FieldSelector>) -> String {
+    let mut result = Vec::new();
+    for FieldSelector { field, operator, value } in selectors {
+        match operator {
+            FieldOperator::Equals => result.push(format!("{field}={value}")),
+            FieldOperator::DoesNotEqual => result.push(format!("{field}!={value}")),
         }
     }
 

@@ -7,8 +7,13 @@ spec:
   interval: 60s
   plans:
   - type: pod
-    labelSelector: app=test
-    fieldSelector: metadata.namespace=default
+    labelSelector:
+      matchLabels:
+        app: test
+    fieldSelector:
+    - field: metadata.namespace
+      operator: equals
+      value: default
   repository:
     name: restic-rest-config 
     namespace: default

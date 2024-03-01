@@ -14,7 +14,7 @@ use crate::{
         BackupJob, BackupSchedule, BackupScheduleState, BackupScheduleStatus, BackupSet,
         BackupSetState,
     },
-    tasks::DateTimeFormatK8s,
+    tasks::{field_selector_to_filter, label_selector_to_filter, DateTimeFormatK8s},
     Context, KubeSnafu, Result, WALLE,
 };
 use kube::{
@@ -189,10 +189,10 @@ impl BackupSchedule {
 
             let mut lp = ListParams::default();
             if let Some(ref ls) = plan.label_selector {
-                lp = lp.labels(ls);
+                lp = lp.labels(&label_selector_to_filter(ls));
             }
             if let Some(ref fs) = plan.field_selector {
-                lp = lp.fields(fs);
+                lp = lp.fields(&field_selector_to_filter(fs));
             }
 
             let resources = api

@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -72,11 +73,10 @@ pub struct BackupPlanSpec {
     pub type_: String,
 
     /// See https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#label-selectors
-    // TODO - Replace with a LabelSelector
-    pub label_selector: Option<String>,
+    pub label_selector: Option<LabelSelector>,
 
     /// See https://kubernetes.io/docs/concepts/overview/working-with-objects/field-selectors
-    pub field_selector: Option<String>,
+    pub field_selector: Option<Vec<FieldSelector>>,
 
     // TODO - Namespace selector
     /// Any workload resources selected by `selector` will then have their PVCs filtered using this
@@ -88,6 +88,21 @@ pub struct BackupPlanSpec {
 
     /// Run in the pod a PVC is mounted to after a snapshot is taken of the PVC
     pub after_snapshot: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FieldSelector {
+    pub field: String,
+    pub operator: FieldOperator,
+    pub value: String,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum FieldOperator {
+    Equals,
+    DoesNotEqual,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
