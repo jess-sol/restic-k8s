@@ -31,7 +31,7 @@ use crate::Context;
 
 impl BackupJob {
     pub async fn reconcile(&self, ctx: Arc<Context<Self>>) -> Result<Action> {
-        let recorder = ctx.diagnostics.read().await.recorder(ctx.kube.client(), self);
+        let recorder = ctx.kube.recorder(self);
         let ns = self.namespace().unwrap();
         let name = self.name_any();
         let backup_jobs: Api<BackupJob> = Api::namespaced(ctx.kube.client(), &ns);
@@ -221,20 +221,29 @@ impl BackupJob {
                     return Ok(Action::requeue(Duration::from_secs(5)));
                 };
 
-                // Fetch logs of latest job to add to completion event
-                let logs = latest_logs_of_job(ctx.kube.client(), &job).await.unwrap();
-                let logs = logs.as_deref().and_then(|logs| {
-                    recover_block_in_string(
-                        logs,
-                        "<<<<<<<<<< START OUTPUT",
-                        "END OUTPUT >>>>>>>>>>",
-                    )
-                });
-
                 let succeeded = job.status.as_ref().map(|x| x.succeeded.unwrap_or(0)).unwrap_or(0);
                 let failed = job.status.as_ref().map(|x| x.failed.unwrap_or(0)).unwrap_or(0);
 
-                if succeeded > 0 || failed >= 5 {
+                let backoff_limit = job.spec.as_ref().and_then(|x| x.backoff_limit).unwrap_or(3);
+                if succeeded > 0 || failed >= backoff_limit {
+                    // Fetch logs of latest job to add to completion event
+                    let logs = latest_logs_of_job(ctx.kube.client(), &job).await;
+                    let logs = match logs {
+                        Ok(Some(ref logs)) => recover_block_in_string(
+                            logs,
+                            "<<<<<<<<<< START OUTPUT",
+                            "END OUTPUT >>>>>>>>>>",
+                        ),
+                        Ok(None) => {
+                            warn!(name, ns, "No logs available for BackupJob");
+                            None
+                        }
+                        Err(err) => {
+                            error!(name, ns, ?err, "Failed to fetch logs for BackupJob");
+                            None
+                        }
+                    };
+
                     if let Err(err) = cleanup_backup_job(&ctx, self).await {
                         error!(name, ns, ?err, "Failed to cleanup BackupJob after finished/failed");
                     }
@@ -287,7 +296,7 @@ impl BackupJob {
 
     // Finalizer cleanup (the object was deleted, ensure nothing is orphaned)
     pub async fn cleanup(&self, ctx: Arc<Context<Self>>) -> Result<Action> {
-        let recorder = ctx.diagnostics.read().await.recorder(ctx.kube.client(), self);
+        let recorder = ctx.kube.recorder(self);
         let result = recorder
             .publish(Event {
                 type_: EventType::Normal,
@@ -561,6 +570,7 @@ pub async fn create_backup_job(
                 "ownerReferences": [backup_job.controller_owner_ref(&()).unwrap()],
             },
             "spec": {
+                "backoffLimit": 3,
                 "template": {
                     "spec": {
                         // TODO - Use specific name of SA in ensure_rbac

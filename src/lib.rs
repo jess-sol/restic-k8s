@@ -149,20 +149,16 @@ pub async fn run_backup_schedules(client: Client, state: State) {
     let controller = Controller::new(backup_schedules, wc.clone())
         .owns(backup_jobs, wc.clone())
         .shutdown_on_signal();
-    let store = controller.store();
+    let context = state.to_context(kube_manager, controller.store());
     tokio::task::spawn(
         controller
-            .run(
-                reconcile_backup_schedule,
-                error_policy_backup_schedule,
-                state.to_context(kube_manager, store.clone()),
-            )
+            .run(reconcile_backup_schedule, error_policy_backup_schedule, context.clone())
             .filter_map(|x| async move { std::result::Result::ok(x) })
             .for_each(|_| future::ready(())),
     );
 
-    let scheduler = Scheduler::new(store);
-    tokio::task::spawn(scheduler.run(client, state.diagnostics().await.reporter));
+    let scheduler = Scheduler::new(context);
+    tokio::task::spawn(scheduler.run());
 }
 
 #[instrument(skip(ctx, backup_schedule), fields(trace_id))]

@@ -1,4 +1,11 @@
-use kube::{core::GroupVersionKind, discovery::ApiResource, Client};
+use kube::{
+    core::GroupVersionKind,
+    discovery::ApiResource,
+    runtime::events::{Recorder, Reporter},
+    Client, Resource,
+};
+
+use crate::WALLE;
 
 pub mod backup;
 pub mod schedule;
@@ -8,6 +15,7 @@ pub mod schedule;
 pub struct KubeManager {
     client: Client,
     pub snapshot_ar: ApiResource,
+    reporter: Reporter,
 }
 
 impl KubeManager {
@@ -21,10 +29,14 @@ impl KubeManager {
         let gvk = GroupVersionKind::gvk("snapshot.storage.k8s.io", "v1", "VolumeSnapshot");
         let (snapshot_ar, _caps) = kube::discovery::pinned_kind(&client, &gvk).await?;
 
-        Ok(Self { client, snapshot_ar })
+        Ok(Self { client, snapshot_ar, reporter: format!("{WALLE}-controller").into() })
     }
 
     pub fn client(&self) -> Client {
         self.client.clone()
+    }
+
+    pub fn recorder(&self, resource: &impl Resource<DynamicType = ()>) -> Recorder {
+        Recorder::new(self.client(), self.reporter.clone(), resource.object_ref(&()))
     }
 }

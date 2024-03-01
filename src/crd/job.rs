@@ -35,7 +35,7 @@ pub struct BackupJobStatus {
     pub backup_job: Option<String>,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, JsonSchema)]
 pub enum BackupJobState {
     NotStarted,
     CreatingSnapshot,

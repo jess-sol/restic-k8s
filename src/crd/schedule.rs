@@ -88,10 +88,35 @@ pub struct RetentionSpec {
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BackupScheduleStatus {
-    // pub condition: String,
+    pub state: BackupScheduleState,
+
+    // Timestamp of when the currently running scheduled backup was triggered, used as a label
+    // value to get currently running BackupJobs
+    pub backup_batch: Option<String>,
+
     pub last_backup_run: Option<String>,
     pub last_check_run: Option<String>,
     pub last_prune_run: Option<String>,
+    pub last_run_stats: Option<LastRunStats>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LastRunStats {
+    pub total_jobs: usize,
+    pub running_jobs: usize,
+    pub finished_jobs: usize,
+    pub failed_jobs: usize,
+    pub unstarted_jobs: usize,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
+pub enum BackupScheduleState {
+    #[default]
+    Waiting,
+    Running,
+    Finished,
+    FinishedWithFailures,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
