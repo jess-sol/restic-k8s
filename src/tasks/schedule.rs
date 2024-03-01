@@ -124,6 +124,21 @@ impl BackupSchedule {
                     }
                 }
             }
+        } else if let Err(err) = backup_schedules
+            .patch_status(
+                &name,
+                &PatchParams::apply(WALLE),
+                &Patch::Merge(json!({
+                    "apiVersion": "ros.io/v1",
+                    "kind": "BackupSchedule",
+                    "status": {
+                        "state": BackupScheduleState::Waiting,
+                    }
+                })),
+            )
+            .await
+        {
+            error!(name, ?err, "Unable to set status for BackupSchedule");
         }
 
         // Check children of batch using labels, update current status to track job statistics.
