@@ -43,7 +43,7 @@ pub struct Statistics {
 impl ToString for Statistics {
     fn to_string(&self) -> String {
         format!(
-            "{}R {}S {}F {}T",
+            "{}→ {}↑ {}↓ / {}",
             self.unstarted_jobs + self.running_jobs,
             self.finished_jobs,
             self.failed_jobs,
