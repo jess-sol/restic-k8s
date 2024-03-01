@@ -13,10 +13,10 @@ use snafu::{OptionExt as _, ResultExt as _};
 
 use crate::{config::AppConfig, crd::BackupJob, InvalidPVCSnafu, KubeSnafu, Result, WALLE};
 
-use std::fs::read_to_string;
 use std::str::FromStr as _;
 use std::sync::Arc;
 use std::time::Duration;
+use std::{env, fs::read_to_string};
 
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{DeleteParams, ListParams, LogParams, PropagationPolicy};
@@ -578,8 +578,8 @@ pub async fn create_backup_job(
                             "imagePullPolicy": "Always",
                             "args": ["backup"],
                             "env": [
-                                // { "name": "RUST_BACKTRACE", "value": "full".to_string() },
-                                // { "name": "RUST_LOG", "value": "trace".to_string() },
+                                { "name": "RUST_BACKTRACE", "value": env::var("RUST_BACKTRACE").unwrap_or_default() },
+                                { "name": "RUST_LOG", "value": env::var("RUST_LOG").unwrap_or_default() },
 
                                 { "name": "REPOSITORY_SECRET", "value": backup_job.spec.repository.to_string() },
                                 { "name": "OPERATOR_NAMESPACE", "value": &operator_namespace },
