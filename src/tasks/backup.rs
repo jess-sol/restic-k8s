@@ -24,7 +24,7 @@ use kube::core::DynamicObject;
 use kube::runtime::events::{Event, EventType};
 
 use kube::runtime::controller::Action;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::crd::{BackupJobState, BackupJobStatus};
 use crate::tasks::DateTimeFormatK8s;
@@ -184,17 +184,8 @@ impl BackupJob {
                     return Ok(Action::requeue(Duration::from_secs(60)));
                 }
 
-                let created_job = create_backup_job(
-                    self,
-                    &pvc,
-                    &snapshot_creation_time,
-                    operator_namespace,
-                    &ctx.config,
-                    &ctx.kube.client(),
-                )
-                .await
-                .unwrap();
-
+                // Set state here because creating backupjob will trigger reconciliation, and
+                // sometimes that leads to two Jobs being created.
                 let _o = backup_jobs
                     .patch_status(
                         &name,
@@ -203,6 +194,28 @@ impl BackupJob {
                             "status": {
                                 "state": BackupJobState::BackingUp,
                                 "startTime": Some(snapshot_creation_time.to_k8s_ts()),
+                            },
+                        })),
+                    )
+                    .await
+                    .with_context(|_| KubeSnafu { msg: "Failed up update backupjob status" })?;
+
+                debug!(name, ns, "Creating Job for BackupJob");
+                let created_job = create_backup_job(
+                    self,
+                    &pvc,
+                    &snapshot_creation_time,
+                    operator_namespace,
+                    &ctx,
+                )
+                .await?;
+
+                let _o = backup_jobs
+                    .patch_status(
+                        &name,
+                        &ps,
+                        &Patch::Merge(json!({
+                            "status": {
                                 "backupJob": Some(created_job.name_any()),
                             },
                         })),
@@ -212,9 +225,15 @@ impl BackupJob {
             }
 
             BackupJobState::BackingUp => {
+                // Ignore reconcilations that happen when state is backingup, but job_name isn't
+                // set. This is a transient state.
+                let Some(job_name) = job_name else {
+                    return Ok(Action::await_change());
+                };
+
                 let jobs: Api<Job> = Api::namespaced(ctx.kube.client(), &ns);
                 let Some(job) = jobs
-                    .get_opt(job_name.unwrap())
+                    .get_opt(job_name)
                     .await
                     .with_context(|_| KubeSnafu { msg: "Failed to retrieve jobs" })?
                 else {
@@ -491,15 +510,15 @@ pub async fn ensure_rbac(
 
 pub async fn create_backup_job(
     backup_job: &BackupJob, pvc: &PersistentVolumeClaim, snapshot_creation_time: &DateTime<Utc>,
-    operator_namespace: String, settings: &AppConfig, client: &Client,
+    operator_namespace: String, ctx: &Context<BackupJob>,
 ) -> Result<Job> {
     let name = format!("{WALLE}-{}-", backup_job.spec.source_pvc);
     let namespace = backup_job.namespace().whatever_context(
         "Unable to get namespace of existing backup_job, this shouldn't happen.",
     )?;
 
-    let jobs: Api<Job> = Api::namespaced(client.clone(), &namespace);
-    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &namespace);
+    let jobs: Api<Job> = Api::namespaced(ctx.kube.client(), &namespace);
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(ctx.kube.client(), &namespace);
 
     let snapshot_name = backup_job
         .status
@@ -574,7 +593,7 @@ pub async fn create_backup_job(
                         "serviceAccountName": "walle-worker",
                         "containers": [{
                             "name": "restic",
-                            "image": &settings.backup_job_image,
+                            "image": &ctx.config.backup_job_image,
                             "imagePullPolicy": "Always",
                             "args": ["backup"],
                             "env": [
@@ -583,7 +602,7 @@ pub async fn create_backup_job(
 
                                 { "name": "REPOSITORY_SECRET", "value": backup_job.spec.repository.to_string() },
                                 { "name": "OPERATOR_NAMESPACE", "value": &operator_namespace },
-                                { "name": "K8S_CLUSTER_NAME", "value": settings.cluster_name },
+                                { "name": "K8S_CLUSTER_NAME", "value": ctx.config.cluster_name },
                                 { "name": "TRACE_ID", "value": crate::telemetry::get_trace_id().to_string() },
 
                                 { "name": "SOURCE_PATH", "value": mount_path },
