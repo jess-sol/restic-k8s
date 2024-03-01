@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use k8s_openapi::api::core::v1::Pod;
 use serde_json::json;
 use std::{
+    cmp::Reverse,
     collections::BTreeMap,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -10,32 +11,32 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     crd::{
-        BackupJob, BackupJobState, BackupSchedule, BackupScheduleState, BackupScheduleStatus,
-        LastRunStats,
+        BackupJob, BackupSchedule, BackupScheduleState, BackupScheduleStatus, BackupSet,
+        BackupSetState,
     },
+    tasks::DateTimeFormatK8s,
     Context, KubeSnafu, Result, WALLE,
 };
 use kube::{
-    api::{ListParams, Patch, PatchParams, PostParams},
+    api::{DeleteParams, ListParams, Patch, PatchParams, PostParams},
     runtime::{
         controller::Action,
         events::{Event, EventType},
     },
     Api, Resource, ResourceExt,
 };
-use snafu::{OptionExt, ResultExt as _};
+use snafu::ResultExt as _;
 
 impl BackupSchedule {
     pub async fn reconcile(&self, ctx: Arc<Context<Self>>) -> Result<Action> {
         let name = self.name_any();
-        let namespace = self.namespace().unwrap_or_else(|| "<unknown>".to_string());
 
-        let backup_schedules: Api<BackupSchedule> =
-            Api::namespaced(ctx.kube.client(), self.namespace().as_ref().unwrap());
+        let backup_schedules: Api<BackupSchedule> = Api::all(ctx.kube.client());
+        let backup_sets: Api<BackupSet> = Api::all(ctx.kube.client());
 
         let recorder = ctx.kube.recorder(self);
 
-        debug!(name, namespace, "Reconciling BackupSchedule");
+        debug!(name, "Reconciling BackupSchedule");
 
         // Set initial status if none
         let Some(status) = self.status.as_ref() else {
@@ -52,103 +53,86 @@ impl BackupSchedule {
                 .await
                 .with_context(|_| KubeSnafu { msg: "Failed up update backupschedule status" })?;
 
-            return Ok(Action::requeue(Duration::ZERO));
+            return Ok(Action::requeue(Duration::from_secs(5)));
         };
+
+        let sets = backup_sets
+            .list(&ListParams::default().labels(&format!("ros.io/backup-schedule={name}")))
+            .await
+            .context(KubeSnafu { msg: "Failed to get BackupSets for BackupSchedule" })?;
+
+        let mut sets = sets.items;
+        sets.sort_unstable_by_key(|x| Reverse(x.creation_timestamp()));
+
+        // Delete extra sets
+        let to_delete = sets
+            .iter()
+            .filter(|x| x.status.as_ref().map(|x| &x.state) == Some(&BackupSetState::Finished))
+            .skip(self.spec.keep_succeeded)
+            .chain(
+                sets.iter()
+                    .filter(|x| {
+                        x.status.as_ref().map(|x| &x.state)
+                            == Some(&BackupSetState::FinishedWithFailures)
+                    })
+                    .skip(self.spec.keep_failed),
+            )
+            .map(|x| (x.name_any(), x.object_ref(&())));
+
+        for (set_name, set_ref) in to_delete {
+            info!(backup_schedule = name, backup_set = set_name, "Cleaning up old BackupSet");
+            if let Err(err) = backup_sets.delete(&set_name, &DeleteParams::default()).await {
+                error!(
+                    backup_schedule = name,
+                    backup_set = set_name,
+                    ?err,
+                    "Failed to cleanup old BackupSet"
+                );
+            } else if let Err(err) = recorder
+                .publish(Event {
+                    type_: EventType::Warning,
+                    reason: "DeletedOldBackupSet".into(),
+                    note: Some("Deleted old BackupSet".into()),
+                    action: "DeletingBackupSet".into(),
+                    secondary: Some(set_ref),
+                })
+                .await
+            {
+                error!(name, ?err, "Failed to add event to backup schedule");
+            }
+        }
+
+        // If latest BackupSet state has changed, reflect it in schedule state
+        if let Some(latest_set) = sets.first() {
+            if let Some(ref set_status) = latest_set.status {
+                if BackupScheduleState::from(&set_status.state) != status.state {
+                    if let Err(err) = backup_schedules
+                        .patch_status(
+                            &name,
+                            &PatchParams::apply(WALLE),
+                            &Patch::Merge(json!({
+                                "apiVersion": "ros.io/v1",
+                                "kind": "BackupSchedule",
+                                "status": {
+                                    "state": set_status.state,
+                                }
+                            })),
+                        )
+                        .await
+                    {
+                        error!(name, ?err, "Unable to set status for BackupSchedule");
+                    }
+                }
+            }
+        }
 
         // Check children of batch using labels, update current status to track job statistics.
         // Check if all jobs have completed, set BackupSchedule state accordingly
         match status.state {
             BackupScheduleState::Running => {
-                let backup_job_api: Api<BackupJob> = Api::all(ctx.kube.client());
-                let backup_jobs = backup_job_api
-                    .list(&ListParams::default().labels(&format!(
-                        "ros.io/schedule-timestamp={}",
-                        status.backup_batch.as_deref().unwrap(),
-                    )))
-                    .await
-                    .context(KubeSnafu {
-                        msg: "Failed to list BackupJobs associated with BackupSchedule",
-                    })?;
+                // Keep state updated
 
-                // Get stats of backup jobs in current batch
-                let mut stats =
-                    LastRunStats { total_jobs: backup_jobs.items.len(), ..Default::default() };
-
-                for backup_job in backup_jobs.iter() {
-                    match backup_job.status.as_ref().map(|x| &x.state) {
-                        Some(&BackupJobState::BackingUp | &BackupJobState::CreatingSnapshot) => {
-                            stats.running_jobs += 1
-                        }
-                        Some(BackupJobState::Finished) => stats.finished_jobs += 1,
-                        Some(BackupJobState::Failed) => stats.failed_jobs += 1,
-                        Some(BackupJobState::NotStarted) | None => stats.unstarted_jobs += 1,
-                    }
-                }
-
-                let mut new_status = json!({ "lastRunStats": stats });
-
-                // If all jobs finished, set state and create event
-                if stats.finished_jobs + stats.failed_jobs > 0
-                    && stats.unstarted_jobs == 0
-                    && stats.running_jobs == 0
-                {
-                    let state = if stats.failed_jobs == 0 {
-                        BackupScheduleState::Finished
-                    } else {
-                        BackupScheduleState::FinishedWithFailures
-                    };
-
-                    let event = if stats.failed_jobs == 0 {
-                        Event {
-                            type_: EventType::Normal,
-                            reason: "FinishedBackup".into(),
-                            note: Some("Backup finished with no errors or warnings".into()),
-                            action: "FinishedBackup".into(),
-                            secondary: None,
-                        }
-                    } else {
-                        Event {
-                            type_: EventType::Warning,
-                            reason: "FinishedBackupWithFailures".into(),
-                            note: Some(format!(
-                                "Backup finished with {} failing jobs",
-                                stats.failed_jobs
-                            )),
-                            action: "FinishedBackupWithFailures".into(),
-                            secondary: None,
-                        }
-                    };
-
-                    if let Err(err) = recorder.publish(event).await {
-                        error!(name, namespace, ?err, "Failed to add event to backup schedule");
-                    }
-
-                    new_status = json!({
-                        "state": state,
-                        "lastRunStats": stats
-                    });
-                }
-
-                // Update status with new run stats and maybe state
-                if let Err(err) = backup_schedules
-                    .patch_status(
-                        &name,
-                        &PatchParams::apply(WALLE),
-                        &Patch::Merge(json!({
-                            "apiVersion": "ros.io/v1",
-                            "kind": "BackupSchedule",
-                            "status": new_status,
-                        })),
-                    )
-                    .await
-                {
-                    error!(
-                        name,
-                        namespace,
-                        ?err,
-                        "Unable to set last_backup_run for backup schedule"
-                    );
-                }
+                // Copy stats
             }
             BackupScheduleState::Waiting
             | BackupScheduleState::Finished
@@ -179,6 +163,8 @@ impl BackupSchedule {
 
     // Find all matching workloads, and create backupjobs for them
     pub async fn run(&self, ctx: &Context<Self>) -> Result<()> {
+        let name = self.name_any();
+
         let mut pvcs = BTreeMap::new();
         for plan in &self.spec.plans {
             // TODO - Move body of loop into function and do better error handling
@@ -218,10 +204,41 @@ impl BackupSchedule {
 
         let mut namespaced_jobs = BTreeMap::new();
 
-        let backup_batch =
-            self.status.as_ref().and_then(|x| x.backup_batch.as_ref()).whatever_context(
-                "Unable to create BackupJob because schedule doesn't have backupBatch set.",
-            )?;
+        // let backup_batch =
+        //     self.status.as_ref().and_then(|x| x.backup_batch.as_ref()).whatever_context(
+        //         "Unable to create BackupJob because schedule doesn't have backupBatch set.",
+        //     )?;
+
+        let set_id = Utc::now().to_k8s_label();
+
+        // First create a BackupSet to attach BackupJobs to
+        let set_api: Api<BackupSet> = Api::all(ctx.kube.client());
+        let set = set_api
+            .create(
+                &PostParams::default(),
+                &serde_json::from_value(json!({
+                    "apiVersion": "ros.io/v1",
+                    "kind": "BackupSet",
+                    "metadata": {
+                        "generateName": format!("{name}-"),
+                        "ownerReferences": [self.controller_owner_ref(&())],
+                        "labels": {
+                            "ros.io/backup-schedule": name,
+                        }
+                    },
+                    "spec": {
+                        "selector": {
+                            "matchLabels": {
+                                "ros.io/backup-schedule": name,
+                                "ros.io/backupset": set_id,
+                            }
+                        }
+                    }
+                }))
+                .expect("Invalid predefined BackupSet spec"),
+            )
+            .await
+            .context(KubeSnafu { msg: "Failed to create BackupSet for scheduled backup" })?;
 
         for ((pvc_ns, pvc_name), plan) in pvcs {
             let api = namespaced_jobs
@@ -234,10 +251,11 @@ impl BackupSchedule {
                     "apiVersion": "ros.io/v1",
                     "kind": "BackupJob",
                     "metadata": {
-                        "generateName": format!("{}-{}-", self.name_any(), pvc_name),
-                        "ownerReferences": [self.controller_owner_ref(&())],
+                        "generateName": format!("{}-{}-", set.name_any(), pvc_name),
+                        "ownerReferences": [set.controller_owner_ref(&())],
                         "labels": {
-                            "ros.io/schedule-timestamp": backup_batch,
+                            "ros.io/backup-schedule": name,
+                            "ros.io/backupset": set_id,
                         }
                     },
                     "spec": {
@@ -299,15 +317,13 @@ impl Scheduler {
         schedule
             .status
             .as_ref()
-            .and_then(|x| x.last_backup_run.as_ref())
+            .and_then(|x| x.scheduler.backup_timestamp.as_ref())
             .map(|x| {
                 schedule
                     .spec
                     .interval
                     .as_ref()
-                    .map(|int| {
-                        int.passed_interval(&DateTime::parse_from_rfc3339(x).unwrap().to_utc())
-                    })
+                    .map(|int| int.passed_interval(&DateTime::from_k8s_ts(x).unwrap()))
                     .unwrap_or(false)
             })
             .unwrap_or(true)
@@ -315,17 +331,18 @@ impl Scheduler {
 
     async fn run_schedule(schedule: Arc<BackupSchedule>, ctx: &Context<BackupSchedule>) {
         let name = schedule.name_any();
-        let namespace = schedule.namespace().unwrap_or_else(|| "<unknown>".to_string());
 
-        let schedules: Api<BackupSchedule> =
-            Api::namespaced(ctx.kube.client(), schedule.meta().namespace.as_ref().unwrap());
+        let schedules: Api<BackupSchedule> = Api::all(ctx.kube.client());
         let recorder = ctx.kube.recorder(&*schedule);
 
-        debug!(name, namespace, "Attempting to check scheduled backup");
+        debug!(name, "Attempting to check scheduled backup");
+
+        // TODO - Need to add assurance that same schedule won't get kicked off multiple times
+        // while looping through store?
 
         // Check schedule isn't currently running, if it is, add a warning event and skip this interval
         if schedule.status.as_ref().map(|x| &x.state) == Some(&BackupScheduleState::Running) {
-            warn!(name, namespace, "Skipping scheduled backup, it's still running");
+            warn!(name, "Skipping scheduled backup, it's still running");
             if let Err(err) = recorder
                 .publish(Event {
                     type_: EventType::Warning,
@@ -336,7 +353,7 @@ impl Scheduler {
                 })
                 .await
             {
-                error!(name, namespace, ?err, "Failed to add event to backup schedule");
+                error!(name, ?err, "Failed to add event to backup schedule");
             }
 
             if let Err(err) = schedules
@@ -347,21 +364,21 @@ impl Scheduler {
                         "apiVersion": "ros.io/v1",
                         "kind": "BackupSchedule",
                         "status": {
-                            // TODO - Reorganize status so scheduling timestamps aren't easy to use
-                            // outside of scheduler
-                            "lastBackupRun": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            "scheduler": {
+                                "backupTimestamp": Utc::now().to_k8s_ts()
+                            }
                         }
                     })),
                 )
                 .await
             {
-                error!(name, namespace, ?err, "Unable to set status for backup schedule");
+                error!(name, ?err, "Unable to set status for backup schedule");
             }
 
             return;
         }
 
-        info!(name, namespace, "Starting backup schedule job");
+        info!(name, "Starting backup schedule job");
         if let Err(err) = recorder
             .publish(Event {
                 type_: EventType::Normal,
@@ -372,10 +389,10 @@ impl Scheduler {
             })
             .await
         {
-            error!(name, namespace, ?err, "Failed to add event to backup schedule");
+            error!(name, ?err, "Failed to add event to backup schedule");
         }
 
-        let timestamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let timestamp = Utc::now().to_k8s_ts();
 
         match schedules
             .patch_status(
@@ -385,8 +402,10 @@ impl Scheduler {
                     "apiVersion": "ros.io/v1",
                     "kind": "BackupSchedule",
                     "status": {
+                        "scheduler": {
+                            "backupTimestamp": timestamp,
+                        },
                         "lastBackupRun": timestamp,
-                        "backupBatch": timestamp.replace(':', "."),
                         "state": BackupScheduleState::Running,
                     }
                 })),
@@ -395,11 +414,11 @@ impl Scheduler {
         {
             Ok(schedule) => {
                 if let Err(err) = schedule.run(ctx).await {
-                    error!(name, namespace, ?err, "Failed to run backup schedule");
+                    error!(name, ?err, "Failed to run backup schedule");
                 }
             }
             Err(err) => {
-                error!(name, namespace, ?err, "Unable to set status for backup schedule");
+                error!(name, ?err, "Unable to set status for backup schedule");
             }
         }
     }

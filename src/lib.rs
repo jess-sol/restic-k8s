@@ -5,7 +5,7 @@ use std::{future, hash::Hash, sync::Arc, time::Duration};
 use tasks::{schedule::Scheduler, KubeManager};
 
 use chrono::{DateTime, Utc};
-use crd::{BackupJob, BackupSchedule};
+use crd::{BackupJob, BackupSchedule, BackupSet};
 use kube::{
     api::ListParams,
     core::{DynamicObject, GroupVersionKind},
@@ -33,7 +33,7 @@ pub mod telemetry;
 
 pub use error::*;
 
-use crate::crd::BACKUP_JOB_FINALIZER;
+use crate::crd::{BACKUP_JOB_FINALIZER, BACKUP_SET_FINALIZER};
 
 pub const WALLE: &str = "walle";
 
@@ -129,8 +129,9 @@ pub async fn run(state: State) {
     let client = Client::try_default().await.expect("failed to create kube Client");
 
     let jobs = tokio::task::spawn(run_backup_jobs(client.clone(), state.clone()));
+    let batches = tokio::task::spawn(run_backup_set(client.clone(), state.clone()));
     let schedule = tokio::task::spawn(run_backup_schedules(client, state));
-    let _ = join!(jobs, schedule);
+    let _ = join!(jobs, batches, schedule);
 }
 
 pub async fn run_backup_schedules(client: Client, state: State) {
@@ -142,12 +143,12 @@ pub async fn run_backup_schedules(client: Client, state: State) {
     }
 
     let wc = watcher::Config::default().any_semantic();
-    let backup_jobs = Api::<BackupJob>::all(client.clone());
+    let backup_sets = Api::<BackupSet>::all(client.clone());
 
     let kube_manager = KubeManager::new(client.clone()).await.unwrap();
 
     let controller = Controller::new(backup_schedules, wc.clone())
-        .owns(backup_jobs, wc.clone())
+        .owns(backup_sets, wc.clone())
         .shutdown_on_signal();
     let context = state.to_context(kube_manager, controller.store());
     tokio::task::spawn(
@@ -169,10 +170,9 @@ async fn reconcile_backup_schedule(
     Span::current().record("trace_id", &field::display(&trace_id));
     // let _timer = ctx.metrics.count_and_measure();
     ctx.diagnostics.write().await.last_event = Utc::now();
-    let ns = backup_schedule.namespace().unwrap(); // doc is namespace scoped
-    let backup_schedules: Api<BackupSchedule> = Api::namespaced(ctx.kube.client(), &ns);
+    let backup_schedules: Api<BackupSchedule> = Api::all(ctx.kube.client());
 
-    info!("Reconciling Document \"{}\" in {}", backup_schedule.name_any(), ns);
+    info!("Reconciling BackupSchedule {}", backup_schedule.name_any());
     finalizer(&backup_schedules, BACKUP_JOB_FINALIZER, backup_schedule, |event| async {
         match event {
             FinalizerEvent::Cleanup(backup_schedule) => backup_schedule.cleanup(ctx.clone()).await,
@@ -187,6 +187,59 @@ fn error_policy_backup_schedule(
     backup_schedule: Arc<BackupSchedule>, error: &AppError, ctx: Arc<Context<BackupSchedule>>,
 ) -> Action {
     warn!("reconcile failed: {:?}", error);
+    // ctx.metrics.reconcile_failure(&backup_schedule.name_any(), error); // TODO
+    Action::requeue(Duration::from_secs(5 * 60))
+}
+
+pub async fn run_backup_set(client: Client, state: State) {
+    let backup_sets = Api::<BackupSet>::all(client.clone());
+    if let Err(e) = backup_sets.list(&ListParams::default().limit(1)).await {
+        error!("CRD is not queryable; {e:?}. Is the CRD installed?");
+        info!("Installation: cargo run --bin crdgen | kubectl apply -f -");
+        std::process::exit(1);
+    }
+
+    let wc = watcher::Config::default().any_semantic();
+    let backup_jobs = Api::<BackupJob>::all(client.clone());
+
+    let kube_manager = KubeManager::new(client.clone()).await.unwrap();
+
+    let controller =
+        Controller::new(backup_sets, wc.clone()).owns(backup_jobs, wc.clone()).shutdown_on_signal();
+    let context = state.to_context(kube_manager, controller.store());
+
+    controller
+        .run(reconcile_backup_set, error_policy_backup_set, context.clone())
+        .filter_map(|x| async move { std::result::Result::ok(x) })
+        .for_each(|_| future::ready(()))
+        .await
+}
+
+#[instrument(skip(ctx, backup_set), fields(trace_id))]
+async fn reconcile_backup_set(
+    backup_set: Arc<BackupSet>, ctx: Arc<Context<BackupSet>>,
+) -> Result<Action> {
+    let trace_id = telemetry::get_trace_id();
+    Span::current().record("trace_id", &field::display(&trace_id));
+    // let _timer = ctx.metrics.count_and_measure();
+    ctx.diagnostics.write().await.last_event = Utc::now();
+    let backup_sets: Api<BackupSet> = Api::all(ctx.kube.client());
+
+    info!("Reconciling BackupSet {}", backup_set.name_any());
+    finalizer(&backup_sets, BACKUP_SET_FINALIZER, backup_set, |event| async {
+        match event {
+            FinalizerEvent::Cleanup(backup_set) => backup_set.cleanup(ctx.clone()).await,
+            FinalizerEvent::Apply(backup_set) => backup_set.reconcile(ctx.clone()).await,
+        }
+    })
+    .await
+    .with_context(|_| FinalizerSnafu)
+}
+
+fn error_policy_backup_set(
+    backup_schedule: Arc<BackupSet>, error: &AppError, ctx: Arc<Context<BackupSet>>,
+) -> Action {
+    warn!("Reconcile failed: {:?}", error);
     // ctx.metrics.reconcile_failure(&backup_schedule.name_any(), error); // TODO
     Action::requeue(Duration::from_secs(5 * 60))
 }
@@ -231,7 +284,7 @@ async fn reconcile_backup_job(
     let ns = backup_job.namespace().unwrap(); // doc is namespace scoped
     let backup_jobs: Api<BackupJob> = Api::namespaced(ctx.kube.client(), &ns);
 
-    info!("Reconciling Document \"{}\" in {}", backup_job.name_any(), ns);
+    info!("Reconciling BackupJob {} in {}", backup_job.name_any(), ns);
     finalizer(&backup_jobs, BACKUP_JOB_FINALIZER, backup_job, |event| async {
         match event {
             FinalizerEvent::Cleanup(backup_job) => backup_job.cleanup(ctx.clone()).await,

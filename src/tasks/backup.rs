@@ -27,6 +27,7 @@ use kube::runtime::controller::Action;
 use tracing::{error, warn};
 
 use crate::crd::{BackupJobState, BackupJobStatus};
+use crate::tasks::DateTimeFormatK8s;
 use crate::Context;
 
 impl BackupJob {
@@ -50,7 +51,7 @@ impl BackupJob {
                 .await
                 .with_context(|_| KubeSnafu { msg: "Failed up update backupjob status" })?;
 
-            return Ok(Action::requeue(Duration::ZERO));
+            return Ok(Action::requeue(Duration::from_secs(5)));
         };
 
         let snapshot_name = status.destination_snapshot.as_deref();
@@ -201,7 +202,7 @@ impl BackupJob {
                         &Patch::Merge(json!({
                             "status": {
                                 "state": BackupJobState::BackingUp,
-                                "startTime": Some(snapshot_creation_time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),),
+                                "startTime": Some(snapshot_creation_time.to_k8s_ts()),
                                 "backupJob": Some(created_job.name_any()),
                             },
                         })),
@@ -263,7 +264,7 @@ impl BackupJob {
                                     },
                                     "backupJob": Option::<String>::None,
                                     "destinationSnapshot": Option::<String>::None,
-                                    "finishTime": Some(Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+                                    "finishTime": Some(Utc::now().to_k8s_ts()),
                                 },
                             })),
                         )
@@ -551,10 +552,6 @@ pub async fn create_backup_job(
         .unwrap();
 
     let mount_path = format!("/data/{}/", backup_job.spec.source_pvc);
-    let start_time = snapshot_creation_time
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-        .replace('T', " ")
-        .replace('Z', "");
 
     jobs.create(
         &PostParams::default(),
@@ -590,7 +587,7 @@ pub async fn create_backup_job(
                                 { "name": "TRACE_ID", "value": crate::telemetry::get_trace_id().to_string() },
 
                                 { "name": "SOURCE_PATH", "value": mount_path },
-                                { "name": "SNAPSHOT_TIME", "value": start_time },
+                                { "name": "SNAPSHOT_TIME", "value": snapshot_creation_time.to_restic_ts() },
                                 { "name": "PVC_NAME", "value": backup_job.spec.source_pvc },
                             ],
                             "volumeMounts": [{

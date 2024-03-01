@@ -11,13 +11,14 @@ pub static BACKUP_SCHEDULE_FINALIZER: &str = "ros.io/backup-schedule";
 
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, JsonSchema)]
 // #[cfg_attr(test, derive(Default))]
-#[kube(kind = "BackupSchedule", group = "ros.io", version = "v1", namespaced)]
+#[kube(kind = "BackupSchedule", group = "ros.io", version = "v1")]
 #[kube(status = "BackupScheduleStatus", shortname = "backup-schedule")]
 // #[kube(
 //     printcolumn = r#"{"name":"State", "type":"string", "description":"Status of BackupJob", "jsonPath":".status.state"}"#
 // )]
+#[kube(printcolumn = r#"{"name":"LastBackup", "type":"date", "jsonPath":".status.lastBackupRun"}"#)]
 #[kube(
-    printcolumn = r#"{"name":"LastBackup", "type":"date", "jsonPath":".status.last_backup_run"}"#
+    printcolumn = r#"{"name":"Status", "type":"string", "description":"Status of BackupJob", "jsonPath":".status.state"}"#
 )]
 #[kube(printcolumn = r#"{"name":"Age", "type":"date", "jsonPath":".metadata.creationTimestamp"}"#)]
 #[serde(rename_all = "camelCase")]
@@ -29,12 +30,25 @@ pub struct BackupScheduleSpec {
 
     pub interval: Option<IntervalSpec>,
 
+    #[serde(default = "default_failed")]
+    pub keep_failed: usize,
+
+    #[serde(default = "default_succeeded")]
+    pub keep_succeeded: usize,
+
     pub prune: Option<PruneJobSpec>,
     pub check: Option<CheckJobSpec>,
 
     /// List of backup plans to run on schedule. The first to match a workload or PVC will be used,
     /// overriding any following plans.
     pub plans: Vec<BackupPlanSpec>,
+}
+
+fn default_failed() -> usize {
+    3
+}
+fn default_succeeded() -> usize {
+    1
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
@@ -58,6 +72,7 @@ pub struct BackupPlanSpec {
     pub type_: String,
 
     /// See https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#label-selectors
+    // TODO - Replace with a LabelSelector
     pub label_selector: Option<String>,
 
     /// See https://kubernetes.io/docs/concepts/overview/working-with-objects/field-selectors
@@ -90,24 +105,21 @@ pub struct RetentionSpec {
 pub struct BackupScheduleStatus {
     pub state: BackupScheduleState,
 
-    // Timestamp of when the currently running scheduled backup was triggered, used as a label
-    // value to get currently running BackupJobs
-    pub backup_batch: Option<String>,
+    /// Contains the timestamps of the last attempted scheduling by the job scheduler. These do not
+    /// reflect the last successful run of a job, as they'll also be updated when a job is skipped.
+    pub scheduler: SchedulerAttemptTimestamps,
 
     pub last_backup_run: Option<String>,
-    pub last_check_run: Option<String>,
-    pub last_prune_run: Option<String>,
-    pub last_run_stats: Option<LastRunStats>,
+    // pub last_check_run: Option<String>,
+    // pub last_prune_run: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct LastRunStats {
-    pub total_jobs: usize,
-    pub running_jobs: usize,
-    pub finished_jobs: usize,
-    pub failed_jobs: usize,
-    pub unstarted_jobs: usize,
+pub struct SchedulerAttemptTimestamps {
+    pub backup_timestamp: Option<String>,
+    // pub check: Option<String>,
+    // pub prune: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
