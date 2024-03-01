@@ -10,12 +10,8 @@ use kube::{
     api::ListParams,
     core::{DynamicObject, GroupVersionKind},
     runtime::{
-        controller::Action,
-        events::{Recorder, Reporter},
-        finalizer::finalizer,
-        finalizer::Event as FinalizerEvent,
-        reflector::Store,
-        watcher, Controller,
+        controller::Action, events::Reporter, finalizer::finalizer,
+        finalizer::Event as FinalizerEvent, reflector::Store, watcher, Controller,
     },
     Api, Client, Resource, ResourceExt,
 };
@@ -116,11 +112,6 @@ pub struct Diagnostics {
 impl Default for Diagnostics {
     fn default() -> Self {
         Self { last_event: Utc::now(), reporter: format!("{WALLE}-controller").into() }
-    }
-}
-impl Diagnostics {
-    fn recorder(&self, client: Client, doc: &BackupJob) -> Recorder {
-        Recorder::new(client, self.reporter.clone(), doc.object_ref(&()))
     }
 }
 
@@ -237,7 +228,7 @@ async fn reconcile_backup_set(
 }
 
 fn error_policy_backup_set(
-    backup_schedule: Arc<BackupSet>, error: &AppError, ctx: Arc<Context<BackupSet>>,
+    backup_set: Arc<BackupSet>, error: &AppError, ctx: Arc<Context<BackupSet>>,
 ) -> Action {
     warn!("Reconcile failed: {:?}", error);
     // ctx.metrics.reconcile_failure(&backup_schedule.name_any(), error); // TODO
@@ -267,7 +258,7 @@ pub async fn run_backup_jobs(client: Client, state: State) {
         .shutdown_on_signal();
     let store = controller.store();
     controller
-        .run(reconcile_backup_job, error_policy, state.to_context(kube_manager, store))
+        .run(reconcile_backup_job, error_policy_backup_job, state.to_context(kube_manager, store))
         .filter_map(|x| async move { std::result::Result::ok(x) })
         .for_each(|_| future::ready(()))
         .await;
@@ -295,7 +286,7 @@ async fn reconcile_backup_job(
     .with_context(|_| FinalizerSnafu)
 }
 
-fn error_policy(
+fn error_policy_backup_job(
     backup_job: Arc<BackupJob>, error: &AppError, ctx: Arc<Context<BackupJob>>,
 ) -> Action {
     warn!("reconcile failed: {:?}", error);

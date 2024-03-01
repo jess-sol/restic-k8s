@@ -1,5 +1,4 @@
-use crate::{AppError, BackupJob};
-use kube::ResourceExt;
+use crate::AppError;
 use prometheus::{histogram_opts, opts, HistogramVec, IntCounter, IntCounterVec, Registry};
 use tokio::time::Instant;
 

@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use kube::CustomResource;
 use schemars::JsonSchema;

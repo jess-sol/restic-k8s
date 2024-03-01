@@ -1,7 +1,7 @@
 use chrono::Utc;
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info};
 
 use crate::{
     crd::{BackupJob, BackupJobState, BackupSet, BackupSetState, BackupSetStatus, Statistics},

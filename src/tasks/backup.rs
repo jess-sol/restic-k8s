@@ -6,12 +6,12 @@ use k8s_openapi::api::{
 };
 use kube::{
     api::{Patch, PatchParams, PostParams},
-    Api, Client, Resource, ResourceExt as _,
+    Api, Resource, ResourceExt as _,
 };
 use serde_json::json;
 use snafu::{OptionExt as _, ResultExt as _};
 
-use crate::{config::AppConfig, crd::BackupJob, InvalidPVCSnafu, KubeSnafu, Result, WALLE};
+use crate::{crd::BackupJob, InvalidPVCSnafu, KubeSnafu, Result, WALLE};
 
 use std::str::FromStr as _;
 use std::sync::Arc;
