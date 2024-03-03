@@ -4,7 +4,6 @@ use std::{
     io,
     ops::Deref,
     process::{Command, ExitCode, ExitStatus},
-    task::Wake,
 };
 
 use clap::{Parser, Subcommand};
@@ -19,10 +18,9 @@ type Result<T, E = Error> = ::std::result::Result<T, E>;
 
 #[snafu::report]
 fn main() -> Result<()> {
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
-        .with(EnvFilter::from_default_env())
-        .init();
+    let mut fmt_layer = tracing_subscriber::fmt::layer();
+    fmt_layer.set_ansi(false);
+    tracing_subscriber::registry().with(fmt_layer).with(EnvFilter::from_default_env()).init();
 
     let args = Cli::parse();
 
