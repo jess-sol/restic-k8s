@@ -1,3 +1,4 @@
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -27,17 +28,18 @@ pub struct BackupJobSpec {
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BackupJobStatus {
-    pub state: BackupJobState,
     pub start_time: Option<String>,
-    pub finish_time: Option<String>,
-    pub destination_snapshot: Option<String>,
-    pub backup_job: Option<String>,
+    pub finish_time: Option<Time>,
+    pub phase: BackupJobState,
+    pub conditions: Vec<Condition>,
+    pub logs: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, JsonSchema)]
 pub enum BackupJobState {
     NotStarted,
     CreatingSnapshot,
+    WaitingBackup,
     BackingUp,
     Finished,
     Failed,

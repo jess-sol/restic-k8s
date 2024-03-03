@@ -1,5 +1,9 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, LabelSelectorRequirement};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{
+    Condition, LabelSelector, LabelSelectorRequirement, Time,
+};
 use kube::{
     core::GroupVersionKind,
     discovery::ApiResource,
@@ -119,6 +123,62 @@ impl From<&BackupSetState> for BackupScheduleState {
             BackupSetState::Running => BackupScheduleState::Running,
             BackupSetState::Finished => BackupScheduleState::Finished,
             BackupSetState::FinishedWithFailures => BackupScheduleState::FinishedWithFailures,
+        }
+    }
+}
+
+struct Conditions<'a> {
+    current: BTreeMap<String, &'a Condition>,
+}
+
+impl<'a> Conditions<'a> {
+    fn new(current: &'a [Condition]) -> Self {
+        let current: BTreeMap<_, _> = current.iter().map(|x| (x.type_.clone(), x)).collect();
+        Self { current }
+    }
+
+    fn get(&self, type_: &str) -> Option<&'a Condition> {
+        self.current.get(type_).copied()
+    }
+
+    fn map<T: 'a>(&'a self, type_: &str, then: impl FnOnce(&'a Condition) -> T) -> Option<T> {
+        self.current.get(type_).copied().map(then)
+    }
+
+    fn map_or<T: 'a>(
+        &'a self, type_: &str, default: T, then: impl FnOnce(&'a Condition) -> T,
+    ) -> T {
+        self.current.get(type_).copied().map_or(default, then)
+    }
+
+    fn merge_new(&self, new_conditions: &mut Vec<Condition>) {
+        // Fix last_transition_time in new_conditions. If type/status didn't change, use old timestamp,
+        // not new one.
+        for new in new_conditions {
+            if let Some(current) = self.current.get(&new.type_) {
+                if current.status == new.status {
+                    new.last_transition_time.0 = current.last_transition_time.0;
+                }
+            };
+        }
+    }
+}
+
+struct PartialCondition<'a> {
+    reason: &'a str,
+    status: &'a str,
+    message: &'a str,
+}
+
+impl<'a> PartialCondition<'a> {
+    fn into_condition(self, type_: &str, generation: Option<i64>) -> Condition {
+        Condition {
+            last_transition_time: Time(Utc::now()),
+            message: self.message.to_string(),
+            observed_generation: generation,
+            reason: self.reason.to_string(),
+            status: self.status.to_string(),
+            type_: type_.to_string(),
         }
     }
 }

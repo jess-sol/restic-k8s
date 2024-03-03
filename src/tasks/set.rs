@@ -71,10 +71,12 @@ impl BackupSet {
                     Statistics { total_jobs: backup_jobs.items.len(), ..Default::default() };
 
                 for backup_job in backup_jobs.iter() {
-                    match backup_job.status.as_ref().map(|x| &x.state) {
-                        Some(&BackupJobState::BackingUp | &BackupJobState::CreatingSnapshot) => {
-                            stats.running_jobs += 1
-                        }
+                    match backup_job.status.as_ref().map(|x| &x.phase) {
+                        Some(
+                            &BackupJobState::BackingUp
+                            | &BackupJobState::WaitingBackup
+                            | &BackupJobState::CreatingSnapshot,
+                        ) => stats.running_jobs += 1,
                         Some(BackupJobState::Finished) => stats.finished_jobs += 1,
                         Some(BackupJobState::Failed) => stats.failed_jobs += 1,
                         Some(BackupJobState::NotStarted) | None => stats.unstarted_jobs += 1,
