@@ -28,7 +28,7 @@ pub struct BackupJobSpec {
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BackupJobStatus {
-    pub start_time: Option<String>,
+    pub start_time: Option<Time>,
     pub finish_time: Option<Time>,
     pub phase: BackupJobState,
     pub conditions: Vec<Condition>,

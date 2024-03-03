@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, Time};
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -124,7 +124,7 @@ pub struct BackupScheduleStatus {
     /// reflect the last successful run of a job, as they'll also be updated when a job is skipped.
     pub scheduler: SchedulerAttemptTimestamps,
 
-    pub last_backup_run: Option<String>,
+    pub last_backup_run: Option<Time>,
     // pub last_check_run: Option<String>,
     // pub last_prune_run: Option<String>,
 }
@@ -132,7 +132,7 @@ pub struct BackupScheduleStatus {
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SchedulerAttemptTimestamps {
-    pub backup_timestamp: Option<String>,
+    pub backup_timestamp: Option<Time>,
     // pub check: Option<String>,
     // pub prune: Option<String>,
 }

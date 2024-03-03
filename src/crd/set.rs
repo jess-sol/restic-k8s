@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use kube::CustomResource;
 use schemars::JsonSchema;
@@ -25,7 +26,7 @@ pub struct BackupSetSpec {
 #[serde(rename_all = "camelCase")]
 pub struct BackupSetStatus {
     pub state: BackupSetState,
-    pub finish_time: Option<String>,
+    pub finish_time: Option<DateTime<Utc>>,
     pub completions: String,
     pub statistics: Statistics,
 }

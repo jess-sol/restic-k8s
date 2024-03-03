@@ -55,16 +55,11 @@ trait DateTimeFormatK8s
 where
     Self: Sized,
 {
-    fn to_k8s_ts(&self) -> String;
     fn to_restic_ts(&self) -> String;
     fn to_k8s_label(&self) -> String;
-    fn from_k8s_ts(timestamp: &str) -> Result<Self, chrono::ParseError>;
 }
 
 impl DateTimeFormatK8s for DateTime<Utc> {
-    fn to_k8s_ts(&self) -> String {
-        self.to_rfc3339_opts(chrono::SecondsFormat::Secs, true) //.replace('T', " ").replace('Z', "")
-    }
 
     fn to_k8s_label(&self) -> String {
         self.to_rfc3339_opts(chrono::SecondsFormat::Secs, true).replace(':', ".")
@@ -72,11 +67,6 @@ impl DateTimeFormatK8s for DateTime<Utc> {
 
     fn to_restic_ts(&self) -> String {
         self.to_rfc3339_opts(chrono::SecondsFormat::Secs, true).replace('T', " ").replace('Z', "")
-    }
-
-    fn from_k8s_ts(timestamp: &str) -> Result<Self, chrono::ParseError> {
-        // Ok(DateTime::parse_from_rfc3339(&format!("{}Z", timestamp.replace(' ', "T")))?.to_utc())
-        Ok(DateTime::parse_from_rfc3339(timestamp)?.to_utc())
     }
 }
 

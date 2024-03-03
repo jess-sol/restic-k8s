@@ -5,7 +5,7 @@ use k8s_openapi::{
         core::v1::{PersistentVolumeClaim, Secret, ServiceAccount},
         rbac::v1::{ClusterRole, RoleBinding},
     },
-    apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::Condition},
+    apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::{Condition, Time}},
 };
 use kube::{
     api::{Patch, PatchParams, PostParams},
@@ -290,7 +290,7 @@ impl BackupJob {
                 &Patch::Merge(json!({
                     "status": {
                         "conditions": new_conditions,
-                        "finishTime": finish_time,
+                        "finishTime": finish_time.map(Time),
                         "phase": phase,
                         "logs": logs,
                     },

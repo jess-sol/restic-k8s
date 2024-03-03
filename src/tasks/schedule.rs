@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::{api::core::v1::Pod, apimachinery::pkg::apis::meta::v1::Time};
 use serde_json::json;
 use std::{
     cmp::Reverse,
@@ -338,7 +338,7 @@ impl Scheduler {
                     .spec
                     .interval
                     .as_ref()
-                    .map(|int| int.passed_interval(&DateTime::from_k8s_ts(x).unwrap()))
+                    .map(|int| int.passed_interval(&x.0))
                     .unwrap_or(false)
             })
             .unwrap_or(true)
@@ -380,7 +380,7 @@ impl Scheduler {
                         "kind": "BackupSchedule",
                         "status": {
                             "scheduler": {
-                                "backupTimestamp": Utc::now().to_k8s_ts()
+                                "backupTimestamp": Time(Utc::now())
                             }
                         }
                     })),
@@ -407,7 +407,7 @@ impl Scheduler {
             error!(name, ?err, "Failed to add event to backup schedule");
         }
 
-        let timestamp = Utc::now().to_k8s_ts();
+        let timestamp = Utc::now();
 
         match schedules
             .patch_status(
@@ -418,9 +418,9 @@ impl Scheduler {
                     "kind": "BackupSchedule",
                     "status": {
                         "scheduler": {
-                            "backupTimestamp": timestamp,
+                            "backupTimestamp": Time(timestamp),
                         },
-                        "lastBackupRun": timestamp,
+                        "lastBackupRun": Time(timestamp),
                         "state": BackupScheduleState::Running,
                     }
                 })),

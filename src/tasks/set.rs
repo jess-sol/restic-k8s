@@ -1,4 +1,5 @@
 use chrono::Utc;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
 use tracing::{debug, error, info};
@@ -128,7 +129,7 @@ impl BackupSet {
 
                     new_status = json!({
                         "state": state,
-                        "finish_time": finish_time.to_k8s_ts(),
+                        "finish_time": Time(finish_time),
                         "statistics": stats,
                         "completions": stats.to_string(),
                     });
