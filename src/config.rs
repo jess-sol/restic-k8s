@@ -9,8 +9,6 @@ pub struct AppConfig {
     pub cluster_name: String,
 
     pub backup_job_image: String,
-
-    pub worker_service_account_name: String,
 }
 
 pub struct WorkerConfig {

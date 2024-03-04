@@ -1,7 +1,6 @@
 ---
 backup_job_image: ghcr.io/jess-sol/walle/worker:latest
 cluster_name: minikube
-worker_service_account_name: walle
 
 snap_class_mappings:
 - storage_class: csi-hostpath-sc

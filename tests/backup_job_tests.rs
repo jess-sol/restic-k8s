@@ -1,14 +1,11 @@
-use std::time::Duration;
-
 use common::MyContext;
 use k8s_openapi::api::{
-    core::v1::{Namespace, Node, PersistentVolumeClaim, Secret, ServiceAccount},
+    core::v1::{Node, PersistentVolumeClaim, Secret, ServiceAccount},
     rbac::v1::{ClusterRole, RoleBinding},
 };
-use kube::{api::PostParams, core::DynamicObject, Api, ResourceExt};
+use kube::{api::PostParams, Api, ResourceExt};
 use serde_json::json;
 use test_context::test_context;
-use tokio::time::timeout;
 use walle::{config::StorageClassToSnapshotClass, crd::BackupJobState};
 
 mod common;
@@ -32,7 +29,6 @@ async fn test_backup_job_rbac_creation(ctx: &mut MyContext) {
         }],
         cluster_name: "minikube".to_string(),
         backup_job_image: "alpine:latest".to_string(),
-        worker_service_account_name: "walle-worker".to_string(),
     })
     .await;
 
