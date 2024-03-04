@@ -1,0 +1,47 @@
+{{- if .Values.rbac.create -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "walle.serviceAccountName" . }}
+  labels:
+    {{- include "walle.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: walle-operator
+rules:
+- apiGroups: [rbac.authorization.k8s.io]
+  resources: [rolebindings, clusterroles]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [ros.io]
+  resources: ["*"]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [batch]
+  resources: [jobs]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [snapshot.storage.k8s.io]
+  resources: [volumesnapshots]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [""]
+  resources: [serviceaccounts, pods, pods/log, secrets, persistentvolumeclaims]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [events.k8s.io]
+  resources: [events]
+  verbs: [get, list, watch, create, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: walle-operator
+subjects:
+- kind: ServiceAccount
+  apiGroup: ""
+  name: {{ include "walle.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  # "roleRef" specifies the binding to a Role / ClusterRole
+  kind: ClusterRole #this must be Role or ClusterRole
+  name: walle-operator
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

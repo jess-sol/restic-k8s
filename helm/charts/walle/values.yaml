@@ -1,0 +1,29 @@
+image:
+  repository: ghcr.io/jess-sol/walle/operator
+  pullPolicy: Always
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+rbac:
+  # Specifies whether service accounts and permissions should be created
+  create: true
+
+  # Name of service account for operator
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+resources: {}
+  # limits:
+  #   cpu: 100m
+  #   memory: 128Mi
+  # requests:
+  #   cpu: 100m
+  #   memory: 128Mi
+
+config: {}

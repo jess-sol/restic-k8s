@@ -1,0 +1,8 @@
+---
+apiVersion: v2
+name: walle
+type: application
+description: Simple snapshot based backup of PVCs for Kubernetes in Rust
+
+version: 0.1.0
+appVersion: "0.1.0"

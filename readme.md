@@ -31,22 +31,29 @@ For workloads:
   default the stdout of the command will be
 
 
+Building images
+---
+```bash
+docker build -f worker/Dockerfile . -t ghcr.io/jess-sol/walle/worker:latest --push
+docker build . -t ghcr.io/jess-sol/walle/operator:latest --push
+```
+
 Development
 ---
-
 ```bash
 minikube start --addons volumesnapshots,csi-hostpath-driver
 kubectl patch storageclass csi-hostpath-sc -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
 k get crd | grep ros.io | awk '{print $1}' | xargs k delete crd
 cargo run --bin crdgen | k apply -f -
 
-docker build -f worker/Dockerfile . -t ghcr.io/jess-sol/walle/worker:latest --push
-minikube image load ghcr.io/jess-sol/walle/worker:latest
-
 k apply -f example/workload.yml
 k create secret generic restic-rest-config --from-env-file=example/restic-secret.env
 
-APP_CONFIG=example/config.yml cargo run
+RUST_LOG=info,walle=debug APP_CONFIG=example/config.yml cargo run
+# Or with Helm
+helm upgrade --install walle ./helm/charts/walle -f example/values.yml
 
 k apply -f example/backup-job.yml
+# Or
+k apply -f example/backup-schedule.yml
 ```
