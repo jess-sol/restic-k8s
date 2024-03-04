@@ -1,21 +1,25 @@
 use chrono::{DateTime, Utc};
 use k8s_openapi::{
     api::{
-        batch::v1::{Job, JobStatus},
+        batch::v1::Job,
         core::v1::{PersistentVolumeClaim, Secret, ServiceAccount},
         rbac::v1::{ClusterRole, RoleBinding},
     },
-    apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::{Condition, Time}},
+    apimachinery::pkg::{
+        api::resource::Quantity,
+        apis::meta::v1::{Condition, Time},
+    },
 };
 use kube::{
-    api::{Patch, PatchParams, PostParams},
+    api::{Patch, PatchParams, PostParams, PropagationPolicy},
     Api, Resource, ResourceExt as _,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use snafu::{OptionExt as _, ResultExt as _};
 
 use crate::{
-    config::StorageClassToSnapshotClass, crd::BackupJob, InvalidPVCSnafu, KubeSnafu, Result, WALLE,
+    config::StorageClassToSnapshotClass, crd::BackupJob, tasks::merge_conditions, InvalidPVCSnafu,
+    KubeSnafu, Result, WALLE,
 };
 
 use std::sync::Arc;
@@ -24,78 +28,22 @@ use std::{cmp::Reverse, str::FromStr as _};
 use std::{env, fs::read_to_string};
 
 use k8s_openapi::api::core::v1::Pod;
-use kube::api::{DeleteParams, ListParams, LogParams, PropagationPolicy};
+use kube::api::{DeleteParams, ListParams, LogParams};
 use kube::core::DynamicObject;
 use kube::runtime::events::{Event, EventType};
 
 use kube::runtime::controller::Action;
 use tracing::{debug, error, info, warn};
 
-use crate::crd::{BackupJobState, BackupJobStatus};
+use crate::crd::BackupJobState;
 use crate::tasks::DateTimeFormatK8s;
 use crate::Context;
 
-use super::{Conditions, PartialCondition};
+use super::PartialCondition;
 
-struct BackupJobInternalState {
-    snapshot: Option<DynamicObject>,
-    job: Option<Job>,
-    source_pvc: Option<PersistentVolumeClaim>,
-}
-
-struct JobState {
-    active: i32,
-    succeeded: i32,
-    failed: i32,
-    backoff_limit: i32,
-}
-
-impl JobState {
-    fn active(&self) -> bool {
-        self.active > 0
-    }
-    fn succeeded(&self) -> bool {
-        self.succeeded > 0
-    }
-    fn failed(&self) -> bool {
-        self.failed > self.backoff_limit
-    }
-
-    fn completed(&self) -> bool {
-        self.succeeded() || self.failed()
-    }
-}
-
-impl BackupJobInternalState {
-    fn job_state(&self) -> JobState {
-        let backoff_limit = self
-            .job
-            .as_ref()
-            .and_then(|x| x.spec.as_ref())
-            .and_then(|x| x.backoff_limit)
-            .unwrap_or(3);
-
-        let active = self.job_status().and_then(|x| x.active).unwrap_or(0);
-        let succeeded = self.job_status().and_then(|x| x.succeeded).unwrap_or(0);
-        let failed = self.job_status().and_then(|x| x.failed).unwrap_or(0);
-        JobState { active, succeeded, failed, backoff_limit }
-    }
-
-    fn job_status(&self) -> Option<&JobStatus> {
-        self.job.as_ref().and_then(|x| x.status.as_ref())
-    }
-
-    fn snapshot_status(&self) -> Option<&serde_json::Value> {
-        self.snapshot.as_ref().and_then(|x| x.data.get("status"))
-    }
-
-    fn snapshot_ready_to_use(&self) -> bool {
-        self.snapshot_status()
-            .and_then(|x| x.get("readyToUse"))
-            .map(|x| x.as_bool().unwrap_or(false))
-            .unwrap_or(false)
-    }
-
+#[derive(Debug)]
+struct SourcePvc(PersistentVolumeClaim);
+impl SourcePvc {
     fn source_pvc_snap_class(
         &self, snap_class_mappings: &[StorageClassToSnapshotClass],
     ) -> Option<String> {
@@ -107,19 +55,208 @@ impl BackupJobInternalState {
     }
 
     fn source_pvc_storage_class(&self) -> Option<&str> {
-        self.source_pvc
-            .as_ref()
-            .and_then(|x| x.spec.as_ref())
-            .and_then(|x| x.storage_class_name.as_deref())
+        self.0.spec.as_ref().and_then(|x| x.storage_class_name.as_deref())
     }
 
     fn source_pvc_storage_size(&self) -> Option<&Quantity> {
-        self.source_pvc
+        self.0
+            .spec
             .as_ref()
-            .and_then(|x| x.spec.as_ref())
             .and_then(|x| x.resources.as_ref())
             .and_then(|x| x.requests.as_ref())
             .and_then(|x| x.get("storage"))
+    }
+}
+
+#[derive(Debug)]
+struct SnapshotExt(DynamicObject);
+impl SnapshotExt {
+    fn snapshot_status(&self) -> Option<&Value> {
+        self.0.data.get("status")
+    }
+
+    fn snapshot_ready_to_use(&self) -> bool {
+        self.snapshot_status()
+            .and_then(|x| x.get("readyToUse"))
+            .map(|x| x.as_bool().unwrap_or(false))
+            .unwrap_or(false)
+    }
+
+    fn snapshot_creation_time(&self) -> Option<DateTime<Utc>> {
+        self.snapshot_status().and_then(|x| x.get("creationTime")).and_then(Value::as_str).map(
+            |x| {
+                chrono::DateTime::from_str(x)
+                    .expect("Unable to parse creationTime from snapshot status")
+            },
+        )
+    }
+}
+
+#[derive(Debug)]
+struct JobExt(Job);
+impl JobExt {
+    fn job_active(&self) -> bool {
+        self.0.status.as_ref().and_then(|x| x.active).unwrap_or(0) > 0
+    }
+    fn job_succeeded(&self) -> bool {
+        self.0.status.as_ref().and_then(|x| x.succeeded).unwrap_or(0) > 0
+    }
+    fn job_failed(&self) -> bool {
+        let backoff_limit = self.0.spec.as_ref().and_then(|x| x.backoff_limit).unwrap_or(3);
+        self.0.status.as_ref().and_then(|x| x.failed).unwrap_or(0) > backoff_limit
+    }
+    fn job_completed(&self) -> bool {
+        self.job_succeeded() || self.job_failed()
+    }
+
+    fn job_completion_time(&self) -> Option<&DateTime<Utc>> {
+        self.0.status.as_ref().and_then(|x| x.completion_time.as_ref()).map(|x| &x.0)
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+enum InternalState {
+    SourcePVCMissing,
+    NotStarted {
+        source_pvc: SourcePvc,
+    },
+    SnapshotExists {
+        source_pvc: SourcePvc,
+        snapshot: SnapshotExt,
+    },
+    JobExists {
+        source_pvc: SourcePvc,
+        snapshot: SnapshotExt,
+        job: JobExt,
+    },
+    Finished {
+        source_pvc: Option<SourcePvc>,
+        snapshot: Option<SnapshotExt>,
+        job: Option<JobExt>,
+        finish_time: DateTime<Utc>,
+    },
+}
+
+impl std::fmt::Display for InternalState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InternalState::SourcePVCMissing => write!(f, "SourcePVCMissing"),
+            InternalState::NotStarted { .. } => write!(f, "NotStarted"),
+            InternalState::SnapshotExists { .. } => write!(f, "SnapshotExists"),
+            InternalState::JobExists { .. } => write!(f, "JobExists"),
+            InternalState::Finished { .. } => write!(f, "Finished"),
+        }
+    }
+}
+
+impl InternalState {
+    fn new(
+        source_pvc: Option<PersistentVolumeClaim>, snapshot: Option<DynamicObject>,
+        job: Option<Job>, finish_time: Option<DateTime<Utc>>,
+    ) -> Self {
+        if let Some(finish_time) = finish_time {
+            return Self::Finished {
+                source_pvc: source_pvc.map(SourcePvc),
+                snapshot: snapshot.map(SnapshotExt),
+                job: job.map(JobExt),
+                finish_time,
+            };
+        }
+
+        let Some(source_pvc) = source_pvc else {
+            return Self::SourcePVCMissing;
+        };
+
+        let source_pvc = SourcePvc(source_pvc);
+        let Some(snapshot) = snapshot else {
+            return Self::NotStarted { source_pvc };
+        };
+
+        let snapshot = SnapshotExt(snapshot);
+        let Some(job) = job else {
+            return Self::SnapshotExists { source_pvc, snapshot };
+        };
+
+        let job = JobExt(job);
+        Self::JobExists { source_pvc, snapshot, job }
+    }
+
+    fn conditions(&self, generation: Option<i64>) -> Vec<Condition> {
+        let mut conditions = Vec::new();
+
+        let condition = match self {
+            Self::SourcePVCMissing => PartialCondition {
+                status: "False",
+                reason: "NotCreated",
+                message: "Source PVC missing",
+            },
+            Self::NotStarted { .. } => PartialCondition {
+                status: "False",
+                reason: "NotCreated",
+                message: "No VolumeSnapshots are associated with BackupJob",
+            },
+            Self::SnapshotExists { .. } => PartialCondition {
+                status: "False",
+                reason: "Waiting",
+                message: "VolumeSnapshot is created but not ready",
+            },
+            Self::JobExists { .. } | Self::Finished { snapshot: Some(_), .. } => PartialCondition {
+                status: "True",
+                reason: "Ready",
+                message: "VolumeSnapshot is ready",
+            },
+            Self::Finished { .. } => PartialCondition {
+                status: "True",
+                reason: "CleanedUp",
+                message: "BackupJob finished and Snapshot doesn't exist",
+            },
+        };
+        conditions.push(condition.into_condition("SnapshotReady", generation));
+
+        let condition = match self {
+            Self::SourcePVCMissing | Self::NotStarted { .. } | Self::SnapshotExists { .. } => {
+                PartialCondition {
+                    status: "False",
+                    reason: "NotCreated",
+                    message: "No Jobs are associated with BackupJob",
+                }
+            }
+            Self::JobExists { job, .. } | Self::Finished { job: Some(job), .. } => {
+                if job.job_active() {
+                    PartialCondition {
+                        status: "False",
+                        reason: "JobRunning",
+                        message: "Job is active",
+                    }
+                } else if job.job_succeeded() {
+                    PartialCondition {
+                        status: "True",
+                        reason: "JobFinished",
+                        message: "Job has at least one successful run",
+                    }
+                } else if job.job_failed() {
+                    PartialCondition {
+                        status: "True",
+                        reason: "JobFailed",
+                        message: "Job has reached maximum number of failed runs",
+                    }
+                } else {
+                    PartialCondition {
+                        status: "False",
+                        reason: "JobWaiting",
+                        message: "Job has no active runs",
+                    }
+                }
+            }
+            Self::Finished { .. } => PartialCondition {
+                status: "True",
+                reason: "CleanedUp",
+                message: "BackupJob finished and Snapshot doesn't exist",
+            },
+        };
+        conditions.push(condition.into_condition("BackupState", generation));
+        conditions
     }
 }
 
@@ -131,156 +268,143 @@ impl BackupJob {
         let backup_jobs: Api<BackupJob> = Api::namespaced(ctx.kube.client(), &ns);
         let ps = PatchParams::apply(WALLE);
 
-        // Set initial status if none
-        let Some(status) = self.status.as_ref() else {
-            let _o = backup_jobs
-                .patch_status(
-                    &name,
-                    &ps,
-                    &Patch::Merge(json!({
-                        "status": BackupJobStatus::default(),
-                    })),
-                )
-                .await
-                .with_context(|_| KubeSnafu { msg: "Failed up update backupjob status" })?;
-
-            return Ok(Action::await_change());
-        };
-
         // Get state of child resources, use to compute current conditions
         let state = self.get_state(ctx.clone()).await?;
-        let conditions = Conditions::new(&status.conditions);
+        info!(name, ns, %state, "Reconciliation starting for BackupJob");
 
-        // Don't try to reconcile after job marked finished
-        if status.finish_time.is_some() {
-            if let Err(err) = cleanup_backup_job(&ctx, &state, self).await {
-                error!(name, ns, ?err, "Failed to cleanup BackupJob after finished/failed");
-            }
-            return Ok(Action::await_change());
-        }
+        match state {
+            InternalState::SourcePVCMissing { .. } => {}
 
-        let snap_class = state
-            .source_pvc_snap_class(&ctx.config.snap_class_mappings)
-            .context(InvalidPVCSnafu)?;
+            InternalState::NotStarted { ref source_pvc } => {
+                let snap_class = source_pvc
+                    .source_pvc_snap_class(&ctx.config.snap_class_mappings)
+                    .context(InvalidPVCSnafu)?;
 
-        let snapshots =
-            Api::<DynamicObject>::namespaced_with(ctx.kube.client(), &ns, &ctx.kube.snapshot_ar);
+                let snapshot_api = Api::<DynamicObject>::namespaced_with(
+                    ctx.kube.client(),
+                    &ns,
+                    &ctx.kube.snapshot_ar,
+                );
 
-        // Create snapshot if it doesn't exist, and hadn't already completed
-        if state.snapshot.is_none()
-            && conditions.map_or("SnapshotReady", true, |x| x.status != "True")
-        {
-            let _created_snap = snapshots
-                .create(
-                    &PostParams::default(),
-                    &serde_json::from_value(json!({
-                        "apiVersion": "snapshot.storage.k8s.io/v1",
-                        "kind": "VolumeSnapshot",
-                        "metadata": {
-                            "generateName": format!("{WALLE}-{}-", &self.spec.source_pvc),
-                            "namespace": self.namespace(),
-                            "labels": {
-                                "app.kubernetes.io/created-by": WALLE,
-                                "ros.io/backup-job": name,
+                snapshot_api
+                    .create(
+                        &PostParams::default(),
+                        &serde_json::from_value(json!({
+                            "apiVersion": "snapshot.storage.k8s.io/v1",
+                            "kind": "VolumeSnapshot",
+                            "metadata": {
+                                "generateName": format!("{WALLE}-{}-", &self.spec.source_pvc),
+                                "namespace": self.namespace(),
+                                "labels": {
+                                    "app.kubernetes.io/created-by": WALLE,
+                                    "ros.io/backup-job": name,
+                                },
+                                "ownerReferences": [self.controller_owner_ref(&()).unwrap()],
                             },
-                            "ownerReferences": [self.controller_owner_ref(&()).unwrap()],
-                        },
-                        "spec": {
+                            "spec": {
                             "volumeSnapshotClassName": snap_class,
                             "source": {
-                                "persistentVolumeClaimName": &self.spec.source_pvc,
-                            }
+                            "persistentVolumeClaimName": &self.spec.source_pvc,
                         }
-                    }))
-                    .with_whatever_context(|_| {
-                        format!(
-                            "Failed to parse predefined VolumeSnapshot for BackupJob {}/{}",
-                            ns, name,
-                        )
-                    })?,
-                )
-                .await
-                .with_context(|_| KubeSnafu { msg: "Failed to create snapshot for backupjob" })?;
-        };
-
-        // Wait till snapshot is ready, then create BackupJob if it doesn't exist and hadn't
-        // already completed
-        if state.snapshot_ready_to_use()
-            && state.job.is_none()
-            && conditions.map_or("BackupState", true, |x| x.status != "True")
-        {
-            let snapshot_creation_time = state
-                .snapshot_status()
-                .and_then(|x| x.get("creationTime"))
-                .and_then(|x| x.as_str())
-                .map(|x| {
-                    chrono::DateTime::from_str(x)
-                        .expect("Unable to parse creationTime from snapshot status")
-                })
-                .unwrap_or(Utc::now());
-
-            let operator_namespace = self.spec.repository.namespace.clone().unwrap_or_else(|| {
-                read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-                    .expect("Unable to get default repository secret namespace")
-            });
-
-            if let Err(err) = ensure_rbac(
-                &ctx.kube.client(),
-                &ns,
-                &self.spec.repository.name,
-                &operator_namespace,
-            )
-            .await
-            {
-                error!(name, ns, ?err, "Unable to configure rbac to create backup job");
-                return Ok(Action::requeue(Duration::from_secs(60)));
+                        }
+                        }))
+                        .with_whatever_context(|_| {
+                            format!(
+                                "Failed to parse predefined VolumeSnapshot for BackupJob {}/{}",
+                                ns, name,
+                            )
+                        })?,
+                    )
+                    .await
+                    .with_context(|_| KubeSnafu {
+                        msg: "Failed to create snapshot for backupjob",
+                    })?;
             }
 
-            debug!(name, ns, "Creating Job for BackupJob");
-            create_backup_job(self, &state, &snapshot_creation_time, operator_namespace, &ctx)
-                .await?;
-        }
+            InternalState::SnapshotExists { ref source_pvc, ref snapshot }
+                if snapshot.snapshot_ready_to_use() =>
+            {
+                let operator_namespace =
+                    self.spec.repository.namespace.clone().unwrap_or_else(|| {
+                        read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+                            .expect("Unable to get default repository secret namespace")
+                    });
 
-        // If backup Job is completed, and still exists in the cluster, fetch logs from Job, record finish_time,
-        // and attempt to cleanup
-        let log_res;
-        let mut logs = None;
-        let mut finish_time = None;
-        if state.job_state().completed()
-            && conditions.map_or("BackupState", false, |x| x.status == "True")
-        {
-            log_res = latest_logs_of_job(ctx.kube.client(), state.job.as_ref().unwrap()).await;
-            logs = match log_res {
-                Ok(Some(ref logs)) => Some(
-                    recover_block_in_string(
-                        logs,
-                        "<<<<<<<<<< START OUTPUT",
-                        "END OUTPUT >>>>>>>>>>",
+                if let Err(err) = ensure_rbac(
+                    &ctx.kube.client(),
+                    &ns,
+                    &self.spec.repository.name,
+                    &operator_namespace,
+                )
+                .await
+                {
+                    error!(name, ns, ?err, "Unable to configure rbac to create backup job");
+                    return Ok(Action::requeue(Duration::from_secs(60)));
+                }
+
+                debug!(name, ns, "Creating Job for BackupJob");
+                create_backup_job(self, source_pvc, snapshot, operator_namespace, &ctx).await?;
+            }
+            InternalState::SnapshotExists { .. } => {}
+
+            // If backup Job is completed, and still exists in the cluster, fetch logs from Job, record finish_time,
+            // and attempt to cleanup
+            InternalState::JobExists { ref job, .. } if job.job_completed() => {
+                let log_res = latest_logs_of_job(ctx.kube.client(), &job.0).await;
+                let logs = match log_res {
+                    Ok(Some(ref logs)) => Some(
+                        recover_block_in_string(
+                            logs,
+                            "<<<<<<<<<< START OUTPUT",
+                            "END OUTPUT >>>>>>>>>>",
+                        )
+                        .unwrap_or(logs),
+                    ),
+                    Ok(None) => {
+                        warn!(name, ns, "No logs available for BackupJob");
+                        None
+                    }
+                    Err(err) => {
+                        error!(name, ns, ?err, "Failed to fetch logs for BackupJob");
+                        None
+                    }
+                };
+
+                backup_jobs
+                    .patch_status(
+                        &name,
+                        &ps,
+                        &Patch::Merge(json!({
+                            "status": {
+                                "finishTime": Time(job.job_completion_time().cloned().unwrap_or_else(Utc::now)),
+                                "logs": logs,
+                            },
+                        })),
                     )
-                    .unwrap_or(logs),
-                ),
-                Ok(None) => {
-                    warn!(name, ns, "No logs available for BackupJob");
-                    None
-                }
-                Err(err) => {
-                    error!(name, ns, ?err, "Failed to fetch logs for BackupJob");
-                    None
-                }
-            };
+                    .await
+                    .with_context(|_| KubeSnafu { msg: "Failed up update BackupJob status" })?;
+            }
+            InternalState::JobExists { .. } => {}
 
-            finish_time = Some(
-                state
-                    .job_status()
-                    .and_then(|x| x.completion_time.as_ref())
-                    .map(|x| x.0)
-                    .unwrap_or(Utc::now()),
-            );
+            // Don't try to reconcile after job marked finished, because resources were cleaned up.
+            InternalState::Finished { ref snapshot, ref job, .. } => {
+                if let Err(err) =
+                    cleanup_backup_job(&ctx, self, snapshot.as_ref(), job.as_ref()).await
+                {
+                    error!(name, ns, ?err, "Failed to cleanup BackupJob after finished/failed");
+                }
+
+                // After reaching finished state, the job's status should no longer be updated
+                return Ok(Action::await_change());
+            }
         }
 
         let phase = Self::compute_phase(&state);
-        let mut new_conditions = self.compute_conditions(&state, &conditions).await?;
-        conditions.merge_new(&mut new_conditions);
+        let mut conditions = state.conditions(self.meta().generation);
+        merge_conditions(
+            &mut conditions,
+            self.status.as_ref().map_or(&[], |x| x.conditions.as_slice()),
+        );
 
         // Keep state up-to-date
         backup_jobs
@@ -289,10 +413,8 @@ impl BackupJob {
                 &ps,
                 &Patch::Merge(json!({
                     "status": {
-                        "conditions": new_conditions,
-                        "finishTime": finish_time.map(Time),
+                        "conditions": conditions,
                         "phase": phase,
-                        "logs": logs,
                     },
                 })),
             )
@@ -303,7 +425,7 @@ impl BackupJob {
         Ok(Action::requeue(Duration::from_secs(5 * 60)))
     }
 
-    async fn get_state(&self, ctx: Arc<Context<Self>>) -> Result<BackupJobInternalState> {
+    async fn get_state(&self, ctx: Arc<Context<Self>>) -> Result<InternalState> {
         let ns = self.namespace().unwrap();
         let name = self.name_any();
 
@@ -329,104 +451,31 @@ impl BackupJob {
             msg: format!("Unable to fetch sourcePvc for backupjob {}/{}", ns, name),
         })?;
 
-        Ok(BackupJobInternalState {
-            job: job.into_iter().next(),
-            snapshot: snapshot.into_iter().next(),
+        Ok(InternalState::new(
             source_pvc,
-        })
+            snapshot.into_iter().next(),
+            job.into_iter().next(),
+            self.status.as_ref().and_then(|x| x.finish_time.clone().map(|x| x.0)),
+        ))
     }
 
-    async fn compute_conditions<'a>(
-        &'a self, state: &BackupJobInternalState, prev: &Conditions<'a>,
-    ) -> Result<Vec<Condition>> {
-        let mut conditions = Vec::new();
-
-        // Check state of snapshot
-        let condition = if state.snapshot_ready_to_use() {
-            PartialCondition { status: "True", reason: "VolumeSnapshotReady", message: "Ready" }
-        } else if state.snapshot.is_some() {
-            PartialCondition {
-                status: "False",
-                reason: "VolumeSnapshotWaiting",
-                message: "VolumeSnapshot is created but not ready",
-            }
-        } else if prev.map_or("SnapshotReady", false, |x| x.reason != "NotCreated") {
-            PartialCondition {
-                status: "False",
-                reason: "NotCreated",
-                message: "No VolumeSnapshots are associated with BackupJob",
-            }
-        } else {
-            PartialCondition {
-                status: "False",
-                reason: "NoSnapshotFound",
-                message: "VolumeSnapshot associated with BackupJob went missing",
-            }
-        };
-
-        conditions.push(condition.into_condition("SnapshotReady", self.meta().generation));
-
-        // Check state of Job
-        let condition = if state.job.is_some() {
-            let job_state = state.job_state();
-
-            if job_state.active() {
-                PartialCondition { status: "False", reason: "JobRunning", message: "Job is active" }
-            } else if job_state.succeeded() {
-                PartialCondition {
-                    status: "True",
-                    reason: "JobFinished",
-                    message: "Job has at least one successful run",
-                }
-            } else if job_state.failed() {
-                PartialCondition {
-                    status: "True",
-                    reason: "JobFailed",
-                    message: "Job has reached maximum number of failed runs",
-                }
-            } else {
-                PartialCondition {
-                    status: "False",
-                    reason: "JobWaiting",
-                    message: "Job has no active runs",
-                }
-            }
-        } else if prev.map_or("BackupState", false, |x| x.reason != "NotCreated") {
-            PartialCondition {
-                status: "False",
-                reason: "JobMissing",
-                message: "Job associated with BackupJob went missing",
-            }
-        } else {
-            PartialCondition {
-                status: "False",
-                reason: "NotCreated",
-                message: "No Jobs are associated with BackupJob",
-            }
-        };
-
-        conditions.push(condition.into_condition("BackupState", self.meta().generation));
-        Ok(conditions)
-    }
-
-    fn compute_phase(state: &BackupJobInternalState) -> BackupJobState {
-        if state.snapshot.is_some() {
-            if state.snapshot_ready_to_use() {
-                let backup_state = state.job_state();
-                if backup_state.active() {
+    fn compute_phase(state: &InternalState) -> BackupJobState {
+        match state {
+            InternalState::SourcePVCMissing => BackupJobState::Failed,
+            InternalState::NotStarted { .. } => BackupJobState::NotStarted,
+            InternalState::SnapshotExists { .. } => BackupJobState::CreatingSnapshot,
+            InternalState::JobExists { job, .. } => {
+                if job.job_active() {
                     BackupJobState::BackingUp
-                } else if backup_state.succeeded() {
+                } else if job.job_succeeded() {
                     BackupJobState::Finished
-                } else if backup_state.failed() {
+                } else if job.job_failed() {
                     BackupJobState::Failed
                 } else {
                     BackupJobState::WaitingBackup
                 }
-            } else {
-                BackupJobState::CreatingSnapshot
             }
-        } else {
-            BackupJobState::NotStarted
+            InternalState::Finished { .. } => BackupJobState::Finished,
         }
     }
 
@@ -452,33 +501,29 @@ impl BackupJob {
 }
 
 async fn cleanup_backup_job(
-    ctx: &Context<BackupJob>, state: &BackupJobInternalState, job: &BackupJob,
+    ctx: &Context<BackupJob>, backup_job: &BackupJob, snapshot: Option<&SnapshotExt>,
+    job: Option<&JobExt>,
 ) -> Result<()> {
-    let snapshots = Api::<DynamicObject>::namespaced_with(
-        ctx.kube.client(),
-        &job.namespace().unwrap(),
-        &ctx.kube.snapshot_ar,
-    );
-
-    if let Some(ref job) = state.job {
-        let jobs: Api<Job> = Api::namespaced(ctx.kube.client(), &job.namespace().unwrap());
-        let _job = jobs
-            .delete(
-                &job.name_any(),
-                &DeleteParams {
-                    propagation_policy: Some(PropagationPolicy::Foreground),
-                    ..Default::default()
-                },
-            )
-            .await
-            .with_context(|_| KubeSnafu { msg: "Failed to cleanup job associated with backupjob" });
+    let dp = DeleteParams {
+        propagation_policy: Some(PropagationPolicy::Foreground),
+        ..Default::default()
+    };
+    if let Some(job) = job {
+        let jobs: Api<Job> = Api::namespaced(ctx.kube.client(), &backup_job.namespace().unwrap());
+        if let Err(err) = jobs.delete(&job.0.name_any(), &dp).await {
+            error!(?err, "Failed to cleanup Job subresource");
+        }
     }
 
-    if let Some(ref snapshot) = state.snapshot {
-        let _ss =
-            snapshots.delete(&snapshot.name_any(), &DeleteParams::default()).await.with_context(
-                |_| KubeSnafu { msg: "Failed to cleanup snapshot associated with backupjob" },
-            );
+    if let Some(snapshot) = snapshot {
+        let snapshots = Api::<DynamicObject>::namespaced_with(
+            ctx.kube.client(),
+            &backup_job.namespace().unwrap(),
+            &ctx.kube.snapshot_ar,
+        );
+        if let Err(ref err) = snapshots.delete(&snapshot.0.name_any(), &dp).await {
+            error!(?err, "Failed to cleanup Snapshot subresource");
+        }
     }
 
     Ok(())
@@ -513,7 +558,7 @@ fn recover_block_in_string<'a>(
 /// Ensure RBAC is properly configured for the job to be able to access the resources it needs
 /// when created with the provided service account in the provided namespace.
 /// Namely access to the repository_secret reference.
-pub async fn ensure_rbac(
+async fn ensure_rbac(
     client: &kube::Client, namespace: &str, repository_secret: &str, repository_secret_ns: &str,
 ) -> Result<(), kube::Error> {
     let secrets: Api<Secret> = Api::namespaced(client.clone(), repository_secret_ns);
@@ -625,7 +670,7 @@ pub async fn ensure_rbac(
 }
 
 async fn create_backup_job(
-    backup_job: &BackupJob, state: &BackupJobInternalState, snapshot_creation_time: &DateTime<Utc>,
+    backup_job: &BackupJob, source_pvc: &SourcePvc, snapshot: &SnapshotExt,
     operator_namespace: String, ctx: &Context<BackupJob>,
 ) -> Result<Job> {
     let name = backup_job.name_any();
@@ -636,13 +681,8 @@ async fn create_backup_job(
     let jobs: Api<Job> = Api::namespaced(ctx.kube.client(), &namespace);
     let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(ctx.kube.client(), &namespace);
 
-    let storage_class = state.source_pvc_storage_class().context(InvalidPVCSnafu)?;
-    let storage_size = state.source_pvc_storage_size().context(InvalidPVCSnafu)?;
-
-    let snapshot = state
-        .snapshot
-        .as_ref()
-        .whatever_context("Trying to create BackupJob but no Snapshot found")?;
+    let storage_class = source_pvc.source_pvc_storage_class().context(InvalidPVCSnafu)?;
+    let storage_size = source_pvc.source_pvc_storage_size().context(InvalidPVCSnafu)?;
 
     let pvc = pvcs
         .create(
@@ -655,12 +695,12 @@ async fn create_backup_job(
                     "labels": {
                         "app.kubernetes.io/created-by": WALLE,
                     },
-                    "ownerReferences": [snapshot.controller_owner_ref(&ctx.kube.snapshot_ar).unwrap()],
+                    "ownerReferences": [snapshot.0.controller_owner_ref(&ctx.kube.snapshot_ar).unwrap()],
                 },
                 "spec": {
                     "storageClassName": storage_class,
                     "dataSource": {
-                        "name": snapshot.name_any(),
+                        "name": snapshot.0.name_any(),
                         "kind": "VolumeSnapshot",
                         "apiGroup": "snapshot.storage.k8s.io"
                     },
@@ -677,6 +717,7 @@ async fn create_backup_job(
         .await
         .unwrap();
 
+    let snapshot_creation_time = snapshot.snapshot_creation_time().unwrap_or(Utc::now());
     let mount_path = format!("/data/{}/", backup_job.spec.source_pvc);
 
     jobs.create(

@@ -60,7 +60,6 @@ where
 }
 
 impl DateTimeFormatK8s for DateTime<Utc> {
-
     fn to_k8s_label(&self) -> String {
         self.to_rfc3339_opts(chrono::SecondsFormat::Secs, true).replace(':', ".")
     }
@@ -117,40 +116,17 @@ impl From<&BackupSetState> for BackupScheduleState {
     }
 }
 
-struct Conditions<'a> {
-    current: BTreeMap<String, &'a Condition>,
-}
-
-impl<'a> Conditions<'a> {
-    fn new(current: &'a [Condition]) -> Self {
-        let current: BTreeMap<_, _> = current.iter().map(|x| (x.type_.clone(), x)).collect();
-        Self { current }
-    }
-
-    fn get(&self, type_: &str) -> Option<&'a Condition> {
-        self.current.get(type_).copied()
-    }
-
-    fn map<T: 'a>(&'a self, type_: &str, then: impl FnOnce(&'a Condition) -> T) -> Option<T> {
-        self.current.get(type_).copied().map(then)
-    }
-
-    fn map_or<T: 'a>(
-        &'a self, type_: &str, default: T, then: impl FnOnce(&'a Condition) -> T,
-    ) -> T {
-        self.current.get(type_).copied().map_or(default, then)
-    }
-
-    fn merge_new(&self, new_conditions: &mut Vec<Condition>) {
-        // Fix last_transition_time in new_conditions. If type/status didn't change, use old timestamp,
-        // not new one.
-        for new in new_conditions {
-            if let Some(current) = self.current.get(&new.type_) {
-                if current.status == new.status {
-                    new.last_transition_time.0 = current.last_transition_time.0;
-                }
-            };
-        }
+/// Fix last_transition_time in new_conditions. If type/status didn't change, use old timestamp,
+/// not new one.
+fn merge_conditions(new_conditions: &mut Vec<Condition>, current_conditions: &[Condition]) {
+    let current_conditions: BTreeMap<_, _> =
+        current_conditions.iter().map(|x| (x.type_.clone(), x)).collect();
+    for new in new_conditions {
+        if let Some(current) = current_conditions.get(&new.type_) {
+            if current.status == new.status {
+                new.last_transition_time.0 = current.last_transition_time.0;
+            }
+        };
     }
 }
 

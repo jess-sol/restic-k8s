@@ -12,9 +12,9 @@ pub static BACKUP_JOB_FINALIZER: &str = "ros.io/backup-job";
 #[kube(kind = "BackupJob", group = "ros.io", version = "v1", namespaced)]
 #[kube(status = "BackupJobStatus", shortname = "backup-job")]
 #[kube(
-    printcolumn = r#"{"name":"Status", "type":"string", "description":"Status of BackupJob", "jsonPath":".status.state"}"#
+    printcolumn = r#"{"name":"Status", "type":"string", "description":"Status of BackupJob", "jsonPath":".status.phase"}"#
 )]
-#[kube(printcolumn = r#"{"name":"Age", "type":"date", "jsonPath":".status.startTime"}"#)]
+#[kube(printcolumn = r#"{"name":"Age", "type":"date", "jsonPath":".metadata.creationTimestamp"}"#)]
 #[serde(rename_all = "camelCase")]
 pub struct BackupJobSpec {
     pub source_pvc: String,

@@ -6,7 +6,7 @@ use tracing::{debug, error, info};
 
 use crate::{
     crd::{BackupJob, BackupJobState, BackupSet, BackupSetState, BackupSetStatus, Statistics},
-    tasks::{label_selector_to_filter, DateTimeFormatK8s},
+    tasks::label_selector_to_filter,
     Context, KubeSnafu, Result, WALLE,
 };
 use kube::{

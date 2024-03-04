@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use k8s_openapi::{api::core::v1::Pod, apimachinery::pkg::apis::meta::v1::Time};
 use serde_json::json;
 use std::{
