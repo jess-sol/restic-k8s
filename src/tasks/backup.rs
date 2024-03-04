@@ -624,16 +624,26 @@ async fn ensure_rbac(
     let binding_name = format!("walle-read-{}", repository_secret);
     let _role_binding = match role_bindings.get_opt(&binding_name).await? {
         Some(existing_binding) => {
+            let mut subjects =
+                existing_binding.subjects.as_ref().map_or_else(Vec::new, |x| x.clone());
+
+            if !subjects.iter().any(|x| {
+                x.name == service_account.name_any() && x.namespace.as_deref() == Some(namespace)
+            }) {
+                subjects.push(k8s_openapi::api::rbac::v1::Subject {
+                    kind: "ServiceAccount".into(),
+                    name: service_account.name_any(),
+                    namespace: Some(namespace.into()),
+                    ..Default::default()
+                });
+            }
+
             role_bindings
                 .patch(
                     &existing_binding.name_any(),
                     &PatchParams::apply(WALLE),
                     &Patch::Merge(json!({
-                        "subjects": [{
-                            "kind": "ServiceAccount",
-                            "name": service_account.name_any(),
-                            "namespace": namespace,
-                        }]
+                        "subjects": subjects,
                     })),
                 )
                 .await?
@@ -737,9 +747,17 @@ async fn create_backup_job(
             "spec": {
                 "backoffLimit": 3,
                 "template": {
+                    "metadata": {
+                        "labels": {
+                            "app.kubernetes.io/created-by": WALLE,
+                        }
+                    },
                     "spec": {
                         // TODO - Use specific name of SA in ensure_rbac
                         "serviceAccountName": "walle-worker",
+                        "securityContext": {
+                            "fsGroup": 65534,
+                        },
                         "containers": [{
                             "name": "restic",
                             "image": &ctx.config.backup_job_image,
