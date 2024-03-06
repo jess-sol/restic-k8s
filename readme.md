@@ -11,10 +11,15 @@ definitely isn't finished.
 CRDS
 ---
 
-**BackupSchedule** - Defines what will get backed up (via a list of selectors),
-when (via a crontab scheduling syntax), and where to (via a secret describing
-the destination Restic repo). Also may configure common cleanup tasks for the
-Restic repository, such as pruning and checking.
+**BackupSchedule** - Defines what will get backed up (via a list of field and
+label selectors), when (via an interval scheduling syntax), and where to (via a
+secret reference describing the destination Restic repo). Also may configure
+common cleanup tasks for the Restic repository, such as pruning and checking
+(Not implemented yet).
+
+**BackupSet** - Defines a set of *BackupJobs* which are grouped together in a
+single run of a *BackupSchedule*. Currently it's not possible to create a
+*BackupSet* manually.
 
 **BackupJob** - Defines a specific workload or PVC to be backed up. Normally
 created by a *BackupSchedule*, but may also be created manually to create a
