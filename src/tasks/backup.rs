@@ -756,7 +756,7 @@ async fn create_backup_job(
                         // TODO - Use specific name of SA in ensure_rbac
                         "serviceAccountName": "walle-worker",
                         "securityContext": {
-                            "fsGroup": 65534,
+                            "fsGroup": 65532,
                         },
                         "containers": [{
                             "name": "restic",
