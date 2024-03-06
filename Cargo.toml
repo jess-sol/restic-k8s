@@ -11,6 +11,12 @@ members = ["worker"]
 name = "crdgen"
 test = false
 
+[profile.release]
+lto = true
+strip = true
+opt-level = "z"
+codegen-units = 1
+
 [dependencies]
 kube = { version = "0.88.1", features = ["runtime", "derive"] }
 k8s-openapi = { version = "0.21.0", features = ["latest", "schemars"] }
