@@ -1,14 +1,7 @@
 use chrono::{DateTime, Utc};
 use k8s_openapi::{
-    api::{
-        batch::v1::Job,
-        core::v1::{PersistentVolumeClaim, Secret, ServiceAccount},
-        rbac::v1::{ClusterRole, RoleBinding},
-    },
-    apimachinery::pkg::{
-        api::resource::Quantity,
-        apis::meta::v1::{Condition, Time},
-    },
+    api::{batch::v1::Job, core::v1::PersistentVolumeClaim},
+    apimachinery::pkg::apis::meta::v1::{Condition, Time},
 };
 use kube::{
     api::{Patch, PatchParams, PostParams, PropagationPolicy},
@@ -17,15 +10,11 @@ use kube::{
 use serde_json::{json, Value};
 use snafu::{OptionExt as _, ResultExt as _};
 
-use crate::{
-    config::StorageClassToSnapshotClass, crd::BackupJob, tasks::merge_conditions, InvalidPVCSnafu,
-    KubeSnafu, Result, WALLE,
-};
+use crate::{crd::BackupJob, tasks::merge_conditions, InvalidPVCSnafu, KubeSnafu, Result, WALLE};
 
 use std::sync::Arc;
 use std::time::Duration;
 use std::{cmp::Reverse, str::FromStr as _};
-use std::{env, fs::read_to_string};
 
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{DeleteParams, ListParams, LogParams};
@@ -39,7 +28,10 @@ use crate::crd::BackupJobState;
 use crate::tasks::DateTimeFormatK8s;
 use crate::Context;
 
-use super::{PartialCondition, SourcePvc};
+use super::{
+    job::{create_job, JobType},
+    PartialCondition, SourcePvc,
+};
 
 #[derive(Debug)]
 struct SnapshotExt(DynamicObject);
@@ -297,26 +289,8 @@ impl BackupJob {
             InternalState::SnapshotExists { ref source_pvc, ref snapshot }
                 if snapshot.snapshot_ready_to_use() =>
             {
-                let operator_namespace =
-                    self.spec.repository.namespace.clone().unwrap_or_else(|| {
-                        read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-                            .expect("Unable to get default repository secret namespace")
-                    });
-
-                if let Err(err) = ensure_rbac(
-                    &ctx.kube.client(),
-                    &ns,
-                    &self.spec.repository.name,
-                    &operator_namespace,
-                )
-                .await
-                {
-                    error!(name, ns, ?err, "Unable to configure rbac to create backup job");
-                    return Ok(Action::requeue(Duration::from_secs(60)));
-                }
-
                 debug!(name, ns, "Creating Job for BackupJob");
-                create_backup_job(self, source_pvc, snapshot, operator_namespace, &ctx).await?;
+                create_backup_job(self, source_pvc, snapshot, &ctx).await?;
             }
             InternalState::SnapshotExists { .. } => {}
 
@@ -528,140 +502,15 @@ fn recover_block_in_string<'a>(
     Some(block.trim())
 }
 
-/// Ensure RBAC is properly configured for the job to be able to access the resources it needs
-/// when created with the provided service account in the provided namespace.
-/// Namely access to the repository_secret reference.
-async fn ensure_rbac(
-    client: &kube::Client, namespace: &str, repository_secret: &str, repository_secret_ns: &str,
-) -> Result<(), kube::Error> {
-    let secrets: Api<Secret> = Api::namespaced(client.clone(), repository_secret_ns);
-    let secret = secrets.get(repository_secret).await?;
-
-    // 1. Create serviceaccount/walle-worker in the backup job namespace
-    let service_accounts: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
-
-    let service_account = match service_accounts.get_opt("walle-worker").await? {
-        Some(sa) => sa,
-        None => {
-            service_accounts
-                .create(
-                    &PostParams::default(),
-                    &serde_json::from_value(json!({
-                        "apiVersion": "v1",
-                        "kind": "ServiceAccount",
-                        "metadata": {
-                            "name": "walle-worker",
-                            // TODO - Add helm labels
-                        }
-                    }))
-                    .expect("Invalid predefined service account json"),
-                )
-                .await?
-        }
-    };
-
-    // 2. Create clusterrole
-    let cluster_roles: Api<ClusterRole> = Api::all(client.clone());
-
-    let role_name = format!("walle-read-{}", repository_secret);
-
-    let cluster_role = match cluster_roles.get_opt(&role_name).await? {
-        Some(role) => role,
-        None => {
-            cluster_roles
-                .create(
-                    &PostParams::default(),
-                    &serde_json::from_value(json!({
-                        "apiVersion": "rbac.authorization.k8s.io/v1",
-                        "kind": "ClusterRole",
-                        "metadata": {
-                            "name": role_name,
-                            "ownerReferences": [secret.controller_owner_ref(&())],
-                        },
-                        "rules": [{
-                            "apiGroups": [""],
-                            "resources": ["secrets"],
-                            "resourceNames": [repository_secret],
-                            "verbs": ["get"],
-                        }],
-                    }))
-                    .expect("Invalid predefined cluster role json"),
-                )
-                .await?
-        }
-    };
-
-    // 3. Create or update rolebinding in secret_ns
-    let role_bindings: Api<RoleBinding> = Api::namespaced(client.clone(), repository_secret_ns);
-
-    let binding_name = format!("walle-read-{}", repository_secret);
-    let _role_binding = match role_bindings.get_opt(&binding_name).await? {
-        Some(existing_binding) => {
-            let mut subjects =
-                existing_binding.subjects.as_ref().map_or_else(Vec::new, |x| x.clone());
-
-            if !subjects.iter().any(|x| {
-                x.name == service_account.name_any() && x.namespace.as_deref() == Some(namespace)
-            }) {
-                subjects.push(k8s_openapi::api::rbac::v1::Subject {
-                    kind: "ServiceAccount".into(),
-                    name: service_account.name_any(),
-                    namespace: Some(namespace.into()),
-                    ..Default::default()
-                });
-            }
-
-            role_bindings
-                .patch(
-                    &existing_binding.name_any(),
-                    &PatchParams::apply(WALLE),
-                    &Patch::Merge(json!({
-                        "subjects": subjects,
-                    })),
-                )
-                .await?
-        }
-        None => {
-            role_bindings
-                .create(
-                    &PostParams::default(),
-                    &serde_json::from_value(json!({
-                        "apiVersion": "rbac.authorization.k8s.io/v1",
-                        "kind": "RoleBinding",
-                        "metadata": {
-                            "name": format!("walle-read-{}", repository_secret),
-                            "ownerReferences": [secret.controller_owner_ref(&())],
-                        },
-                        "roleRef": {
-                            "apiGroup": "rbac.authorization.k8s.io",
-                            "kind": "ClusterRole",
-                            "name": cluster_role.name_any(),
-                        },
-                        "subjects": [{
-                            "kind": "ServiceAccount",
-                            "name": service_account.name_any(),
-                            "namespace": namespace,
-                        }]
-                    }))
-                    .expect("Invalid predefined cluster role json"),
-                )
-                .await?
-        }
-    };
-
-    Ok(())
-}
-
 async fn create_backup_job(
     backup_job: &BackupJob, source_pvc: &SourcePvc, snapshot: &SnapshotExt,
-    operator_namespace: String, ctx: &Context<BackupJob>,
+    ctx: &Context<BackupJob>,
 ) -> Result<Job> {
     let name = backup_job.name_any();
     let namespace = backup_job.namespace().whatever_context(
         "Unable to get namespace of existing BackupJob, this shouldn't happen.",
     )?;
 
-    let jobs: Api<Job> = Api::namespaced(ctx.kube.client(), &namespace);
     let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(ctx.kube.client(), &namespace);
 
     let storage_class = source_pvc.source_pvc_storage_class().context(InvalidPVCSnafu)?;
@@ -703,68 +552,32 @@ async fn create_backup_job(
     let snapshot_creation_time = snapshot.snapshot_creation_time().unwrap_or(Utc::now());
     let mount_path = format!("/data/{}/", backup_job.spec.source_pvc);
 
-    jobs.create(
-        &PostParams::default(),
-        &serde_json::from_value(json!({
-            "apiVersion": "batch/v1",
-            "kind": "Job",
-            "metadata": {
-                "generateName": format!("{WALLE}-backup-{}-", name),
-                "namespace": namespace,
-                "labels": {
-                    "app.kubernetes.io/created-by": WALLE,
-                    "ros.io/backup-job": backup_job.name_any(),
-                },
-                "ownerReferences": [backup_job.controller_owner_ref(&()).unwrap()],
-            },
-            "spec": {
-                "backoffLimit": 3,
-                "template": {
-                    "metadata": {
-                        "labels": {
-                            "app.kubernetes.io/created-by": WALLE,
-                        }
+    let job_extra = json!({
+        "spec": {
+            "template": {
+                "spec": {
+                    "securityContext": {
+                        "fsGroup": 65532, // TODO - Represents the nonroot user group in the walle-worker docker image. Don't hardcode
                     },
-                    "spec": {
-                        // TODO - Use specific name of SA in ensure_rbac
-                        "serviceAccountName": "walle-worker",
-                        "securityContext": {
-                            "fsGroup": 65532,
-                        },
-                        "containers": [{
-                            "name": "restic",
-                            "image": &ctx.config.backup_job_image,
-                            "imagePullPolicy": "Always",
-                            "args": ["backup"],
-                            "env": [
-                                { "name": "RUST_BACKTRACE", "value": env::var("RUST_BACKTRACE").unwrap_or_default() },
-                                { "name": "RUST_LOG", "value": env::var("RUST_LOG").unwrap_or_default() },
-
-                                { "name": "REPOSITORY_SECRET", "value": backup_job.spec.repository.to_string() },
-                                { "name": "OPERATOR_NAMESPACE", "value": &operator_namespace },
-                                { "name": "K8S_CLUSTER_NAME", "value": ctx.config.cluster_name },
-                                { "name": "TRACE_ID", "value": crate::telemetry::get_trace_id().to_string() },
-
-                                { "name": "SOURCE_PATH", "value": mount_path },
-                                { "name": "SNAPSHOT_TIME", "value": snapshot_creation_time.to_restic_ts() },
-                                { "name": "PVC_NAME", "value": backup_job.spec.source_pvc },
-                            ],
-                            "volumeMounts": [{
-                                "name": "snapshot",
-                                "mountPath": mount_path,
-                            }]
-                        }],
-                        "restartPolicy": "Never",
-                        "volumes": [{
+                    "containers": [{
+                        "name": "restic",
+                        "env": [
+                            { "name": "SOURCE_PATH", "value": mount_path },
+                            { "name": "SNAPSHOT_TIME", "value": snapshot_creation_time.to_restic_ts() },
+                            { "name": "PVC_NAME", "value": backup_job.spec.source_pvc },
+                        ],
+                        "volumeMounts": [{
                             "name": "snapshot",
-                            "persistentVolumeClaim": { "claimName": pvc.name_any() }
-                        }],
-                    }
+                            "mountPath": mount_path,
+                        }]
+                    }],
+                    "volumes": [{
+                        "name": "snapshot",
+                        "persistentVolumeClaim": { "claimName": pvc.name_any() }
+                    }],
                 }
             }
-        }))
-        .unwrap(),
-    )
-    .await
-    .with_context(|_| KubeSnafu { msg: "Failed to create snapshot for backupjob" })
+        }
+    });
+    create_job(backup_job, JobType::Backup, ctx, job_extra).await
 }

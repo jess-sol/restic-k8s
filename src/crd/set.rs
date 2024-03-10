@@ -60,3 +60,13 @@ pub enum BackupSetState {
     Finished,
     FinishedWithFailures,
 }
+
+impl BackupSetState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BackupSetState::Running => "Running",
+            BackupSetState::Finished => "Finished",
+            BackupSetState::FinishedWithFailures => "FinishedWithFailures",
+        }
+    }
+}

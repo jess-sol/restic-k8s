@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, Time};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, LabelSelector, Time};
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -108,11 +108,11 @@ pub enum FieldOperator {
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RetentionSpec {
-    pub hourly: u32,
-    pub daily: u32,
-    pub weekly: u32,
-    pub monthly: u32,
-    pub yearly: u32,
+    pub hourly: Option<u32>,
+    pub daily: Option<u32>,
+    pub weekly: Option<u32>,
+    pub monthly: Option<u32>,
+    pub yearly: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
@@ -120,21 +120,24 @@ pub struct RetentionSpec {
 pub struct BackupScheduleStatus {
     pub state: BackupScheduleState,
 
+    /// These reflect the last actual start of a job
+    pub last_backup_run: Option<Time>,
+    pub last_check_run: Option<String>,
+    pub last_prune_run: Option<String>,
+
+    pub conditions: Vec<Condition>,
+
     /// Contains the timestamps of the last attempted scheduling by the job scheduler. These do not
     /// reflect the last successful run of a job, as they'll also be updated when a job is skipped.
     pub scheduler: SchedulerAttemptTimestamps,
-
-    pub last_backup_run: Option<Time>,
-    // pub last_check_run: Option<String>,
-    // pub last_prune_run: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SchedulerAttemptTimestamps {
     pub backup_timestamp: Option<Time>,
-    // pub check: Option<String>,
-    // pub prune: Option<String>,
+    pub check_timestamp: Option<Time>,
+    pub prune_timestamp: Option<Time>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
@@ -144,6 +147,7 @@ pub enum BackupScheduleState {
     Running,
     Finished,
     FinishedWithFailures,
+    CheckFailed,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]

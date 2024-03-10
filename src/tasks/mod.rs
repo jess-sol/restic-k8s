@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fs::read_to_string};
 
 use chrono::{DateTime, Utc};
 use k8s_openapi::{
@@ -15,6 +15,7 @@ use kube::{
     Client, Resource,
 };
 
+use crate::Result;
 use crate::{
     config::StorageClassToSnapshotClass,
     crd::{BackupScheduleState, BackupSetState, FieldOperator, FieldSelector},
@@ -22,6 +23,7 @@ use crate::{
 };
 
 pub mod backup;
+pub mod job;
 pub mod schedule;
 pub mod set;
 
@@ -31,6 +33,7 @@ pub struct KubeManager {
     client: Client,
     pub snapshot_ar: ApiResource,
     reporter: Reporter,
+    pub operator_namespace: String,
 }
 
 impl KubeManager {
@@ -44,7 +47,16 @@ impl KubeManager {
         let gvk = GroupVersionKind::gvk("snapshot.storage.k8s.io", "v1", "VolumeSnapshot");
         let (snapshot_ar, _caps) = kube::discovery::pinned_kind(&client, &gvk).await?;
 
-        Ok(Self { client, snapshot_ar, reporter: format!("{WALLE}-controller").into() })
+        let operator_namespace =
+            read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+                .unwrap_or_else(|_| client.default_namespace().to_owned());
+
+        Ok(Self {
+            client,
+            snapshot_ar,
+            reporter: format!("{WALLE}-controller").into(),
+            operator_namespace,
+        })
     }
 
     pub fn client(&self) -> Client {
@@ -119,6 +131,23 @@ impl From<&BackupSetState> for BackupScheduleState {
             BackupSetState::FinishedWithFailures => BackupScheduleState::FinishedWithFailures,
         }
     }
+}
+
+/// Merge new conditions into existing conditions, overwriting when necessary.
+fn update_conditions(conditions: &mut Vec<Condition>, new_conditions: Vec<Condition>) {
+    let mut new_conditions: BTreeMap<_, _> =
+        new_conditions.into_iter().map(|x| (x.type_.clone(), x)).collect();
+
+    for current in conditions.iter_mut() {
+        if let Some(mut new) = new_conditions.remove(&current.type_) {
+            if current.status == new.status {
+                new.last_transition_time.0 = current.last_transition_time.0;
+            }
+            *current = new;
+        }
+    }
+
+    conditions.extend(new_conditions.into_values());
 }
 
 /// Fix last_transition_time in new_conditions. If type/status didn't change, use old timestamp,

@@ -135,11 +135,13 @@ pub async fn run_backup_schedules(client: Client, state: State) {
 
     let wc = watcher::Config::default().any_semantic();
     let backup_sets = Api::<BackupSet>::all(client.clone());
+    let jobs = Api::<Job>::all(client.clone());
 
     let kube_manager = KubeManager::new(client.clone()).await.unwrap();
 
     let controller = Controller::new(backup_schedules, wc.clone())
         .owns(backup_sets, wc.clone())
+        .owns(jobs, wc.clone())
         .shutdown_on_signal();
     let context = state.to_context(kube_manager, controller.store());
     tokio::task::spawn(

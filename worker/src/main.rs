@@ -14,6 +14,10 @@ use tokio::runtime::Builder;
 use tracing::{debug, error, info};
 use tracing_subscriber::{prelude::*, EnvFilter};
 
+use crate::retention::RetentionSpec;
+
+mod retention;
+
 type Result<T, E = Error> = ::std::result::Result<T, E>;
 
 #[snafu::report]
@@ -29,9 +33,11 @@ fn main() -> Result<()> {
             .with_context(|_| ConfigIoSnafu { msg: "No namespace argument provided, and unable to read namespace from default Pod path" })?
     );
 
+    let restic_path = args.restic_path.unwrap_or("/restic".to_string());
+
     match args.command {
         Commands::Backup { source_path, snapshot_time, pvc_name } => do_backup(
-            args.restic_path.unwrap_or("/restic".to_string()),
+            restic_path,
             args.k8s_cluster_name,
             args.operator_namespace,
             namespace,
@@ -41,8 +47,12 @@ fn main() -> Result<()> {
             pvc_name,
         ),
         Commands::Restore { snapshot } => do_restore(snapshot),
-        Commands::Check {} => do_check(),
-        Commands::Purge {} => do_purge(),
+        Commands::Check {} => {
+            do_check(restic_path, args.operator_namespace, args.repository_secret)
+        }
+        Commands::Prune { retain } => {
+            do_prune(restic_path, args.operator_namespace, args.repository_secret, retain)
+        }
     }
 }
 
@@ -102,7 +112,10 @@ enum Commands {
         snapshot: String,
     },
     Check {},
-    Purge {},
+    Prune {
+        #[arg(long, env)]
+        retain: String,
+    },
 }
 
 fn do_backup(
@@ -163,6 +176,114 @@ fn do_backup(
         BackupFailedSnafu { exit_code: exit.exit_code() }.fail()?;
     }
 
+    Ok(())
+}
+
+fn do_check(
+    restic_path: String, operator_namespace: Option<String>, repository_secret: String,
+) -> Result<()> {
+    info!("Starting restic, output being redirected...");
+
+    let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+
+    let repo_env_vars = runtime.block_on(async {
+        let client = kube::Client::try_default().await.expect("Unable to create Kubernetes client");
+        get_repository_secret(client, operator_namespace, repository_secret).await
+    });
+
+    println!("<<<<<<<<<< START OUTPUT");
+    info!(
+        "Checking repository {}",
+        repo_env_vars.get("RESTIC_REPOSITORY").map_or("<unset repository>", String::deref),
+    );
+    debug!("Starting restic {}", restic_path);
+
+    if repo_env_vars.get("INITIALIZE_REPO").map(|x| is_truthy(x.as_str())).unwrap_or(false) {
+        info!("Ensuring repository is initialized");
+        initialize_repository(&restic_path, &repo_env_vars)?;
+    }
+
+    let mut process = Command::new(restic_path)
+        .args(["check"])
+        .envs(repo_env_vars)
+        .spawn()
+        .with_context(|_| ProcessSpawnSnafu)?;
+
+    // Even though communication pipes have closed, ensure process has also exited.
+    let exit_status = process.wait().with_context(|_| ProcessIOSnafu)?;
+    println!("END OUTPUT >>>>>>>>>>");
+
+    if !exit_status.success() {
+        let exit = ResticExitCodes::new(exit_status);
+        error!("Restic check failed with exit code {}: {}", exit.code(), exit.reason());
+        BackupFailedSnafu { exit_code: exit.exit_code() }.fail()?;
+    }
+
+    Ok(())
+}
+
+fn do_prune(
+    restic_path: String, operator_namespace: Option<String>, repository_secret: String,
+    retain: String,
+) -> Result<()> {
+    info!("Starting restic, output being redirected...");
+
+    let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+
+    let repo_env_vars = runtime.block_on(async {
+        let client = kube::Client::try_default().await.expect("Unable to create Kubernetes client");
+        get_repository_secret(client, operator_namespace, repository_secret).await
+    });
+
+    println!("<<<<<<<<<< START OUTPUT");
+    info!(
+        "Purging repository {}",
+        repo_env_vars.get("RESTIC_REPOSITORY").map_or("<unset repository>", String::deref),
+    );
+    debug!("Starting restic {}", restic_path);
+
+    if repo_env_vars.get("INITIALIZE_REPO").map(|x| is_truthy(x.as_str())).unwrap_or(false) {
+        info!("Ensuring repository is initialized");
+        initialize_repository(&restic_path, &repo_env_vars)?;
+    }
+
+    let retention: RetentionSpec = retain.parse().expect("Failed to parse RetentionSpec");
+    let mut args = vec!["forget".into()];
+    args.append(&mut retention.as_args());
+
+    info!("Forgetting old snapshots");
+    let mut process = Command::new(&restic_path)
+        .args(args)
+        .envs(&repo_env_vars)
+        .spawn()
+        .with_context(|_| ProcessSpawnSnafu)?;
+
+    let exit_status = process.wait().with_context(|_| ProcessIOSnafu)?;
+    if !exit_status.success() {
+        let exit = ResticExitCodes::new(exit_status);
+        error!("Restic forget failed with exit code {}: {}", exit.code(), exit.reason());
+        BackupFailedSnafu { exit_code: exit.exit_code() }.fail()?;
+    }
+
+    info!("Pruning after forgetting snapshots");
+    let mut process = Command::new(&restic_path)
+        .args(["prune"])
+        .envs(repo_env_vars)
+        .spawn()
+        .with_context(|_| ProcessSpawnSnafu)?;
+
+    let exit_status = process.wait().with_context(|_| ProcessIOSnafu)?;
+    if !exit_status.success() {
+        let exit = ResticExitCodes::new(exit_status);
+        error!("Restic prune failed with exit code {}: {}", exit.code(), exit.reason());
+        BackupFailedSnafu { exit_code: exit.exit_code() }.fail()?;
+    }
+    println!("END OUTPUT >>>>>>>>>>");
+
+    Ok(())
+}
+
+fn do_restore(snapshot: String) -> Result<()> {
     Ok(())
 }
 
@@ -263,8 +384,6 @@ fn decode_secret(secret: &Secret) -> BTreeMap<String, String> {
     res
 }
 
-// TODO - Add get_repository_secret error enum
-
 #[derive(Debug, Snafu)]
 enum BackupError {
     #[snafu(display("Failed to spawn restic subprocess: {source}\n{backtrace}"))]
@@ -283,17 +402,6 @@ enum BackupError {
     InitializeRepoError,
     #[snafu(display("restic failed with exit code: {exit_code:?}"))]
     BackupFailed { exit_code: Option<ExitCode> },
-}
-
-fn do_restore(snapshot: String) -> Result<()> {
-    Ok(())
-}
-fn do_check() -> Result<()> {
-    Ok(())
-}
-
-fn do_purge() -> Result<()> {
-    Ok(())
 }
 
 fn is_truthy(value: &str) -> bool {
