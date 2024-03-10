@@ -30,6 +30,9 @@ snapshot of a workload or PVC.
 
 Annotations
 ---
+*Not currently implemented.* This is future state, annotations will be
+available to help customize how to backup a workload.
+
 For workloads:
 - ros.io/before-backup - Command will be run in the container(s) before
   starting snapshot
@@ -37,7 +40,6 @@ For workloads:
   has finished
 - ros.io/backup-command - Command will be run within a container, and by
   default the stdout of the command will be
-
 
 Getting Started
 ---
