@@ -39,6 +39,46 @@ For workloads:
   default the stdout of the command will be
 
 
+Getting Started
+---
+
+1. Install operator
+    ```bash
+    cargo run --bin crdgen | kubectl apply -f -
+
+    kubectl create namespace walle
+    helm upgrade -n walle --install walle ./helm/charts/walle -f example/values.yml
+    ```
+
+2. Create secret describing Restic repository
+    ```bash
+    # See restic docs for details on available environment variables
+    # https://restic.readthedocs.io/en/latest/030_preparing_a_new_repo.html
+    kubectl create secret generic -n walle restic-repo \
+      --from-literal INITIALIZE_REPO=yes \
+      --from-literal RESTIC_PASSWORD=averysecurepassword \
+      --from-literal RESTIC_REST_USERNAME=user \
+      --from-literal RESTIC_REST_PASSWORD=pass
+    ```
+
+3. Create a BackupSchedule
+    ```bash
+    cat <<'EOF' | k apply -f -
+    ---
+    apiVersion: ros.io/v1
+    kind: BackupSchedule
+    metadata:
+      name: example-schedule
+    spec:
+      interval: 6h
+      plans:
+      - type: pod
+      repository:
+        name: restic-repo
+        namespace: walle
+    EOF
+    ```
+
 Building images
 ---
 ```bash
