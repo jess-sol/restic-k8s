@@ -1,5 +1,7 @@
-Simple Kubernetes backups
+Walle
 ===
+
+Simple Kubernetes backups.
 
 This Operator is designed to provide simple backups of PVCs in StorageClasses
 that implement snapshotting. It works by snapshotting selected PVCs, mounting
@@ -12,10 +14,11 @@ CRDS
 ---
 
 **BackupSchedule** - Defines what will get backed up (via a list of field and
-label selectors), when (via an interval scheduling syntax), and where to (via a
-secret reference describing the destination Restic repo). Also may configure
-common cleanup tasks for the Restic repository, such as pruning and checking
-(Not implemented yet).
+label selectors known as plans), when (via an interval scheduling syntax), and
+where to (via a secret reference describing the destination Restic repo). Also
+may configure common cleanup tasks for the Restic repository, such as pruning
+and checking (Not implemented). Settings of the first matching plan will be
+used for PVCs in multiple plans.
 
 **BackupSet** - Defines a set of *BackupJobs* which are grouped together in a
 single run of a *BackupSchedule*. Currently it's not possible to create a

@@ -1,8 +1,12 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{
-    Condition, LabelSelector, LabelSelectorRequirement, Time,
+use k8s_openapi::{
+    api::core::v1::PersistentVolumeClaim,
+    apimachinery::pkg::{
+        api::resource::Quantity,
+        apis::meta::v1::{Condition, LabelSelector, LabelSelectorRequirement, Time},
+    },
 };
 use kube::{
     core::GroupVersionKind,
@@ -12,6 +16,7 @@ use kube::{
 };
 
 use crate::{
+    config::StorageClassToSnapshotClass,
     crd::{BackupScheduleState, BackupSetState, FieldOperator, FieldSelector},
     WALLE,
 };
@@ -146,5 +151,32 @@ impl<'a> PartialCondition<'a> {
             status: self.status.to_string(),
             type_: type_.to_string(),
         }
+    }
+}
+
+#[derive(Debug)]
+struct SourcePvc(PersistentVolumeClaim);
+impl SourcePvc {
+    fn source_pvc_snap_class(
+        &self, snap_class_mappings: &[StorageClassToSnapshotClass],
+    ) -> Option<String> {
+        let storage_class = self.source_pvc_storage_class()?;
+        snap_class_mappings
+            .iter()
+            .find(|x| x.storage_class == *storage_class)
+            .map(|x| x.snapshot_class.clone())
+    }
+
+    fn source_pvc_storage_class(&self) -> Option<&str> {
+        self.0.spec.as_ref().and_then(|x| x.storage_class_name.as_deref())
+    }
+
+    fn source_pvc_storage_size(&self) -> Option<&Quantity> {
+        self.0
+            .spec
+            .as_ref()
+            .and_then(|x| x.resources.as_ref())
+            .and_then(|x| x.requests.as_ref())
+            .and_then(|x| x.get("storage"))
     }
 }

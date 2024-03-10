@@ -1,5 +1,8 @@
 use chrono::Utc;
-use k8s_openapi::{api::core::v1::Pod, apimachinery::pkg::apis::meta::v1::Time};
+use k8s_openapi::{
+    api::core::v1::{PersistentVolumeClaim, Pod},
+    apimachinery::pkg::apis::meta::v1::Time,
+};
 use serde_json::json;
 use std::{
     cmp::Reverse,
@@ -15,7 +18,7 @@ use crate::{
         BackupSetState,
     },
     tasks::{field_selector_to_filter, label_selector_to_filter, DateTimeFormatK8s},
-    Context, KubeSnafu, Result, WALLE,
+    Context, InvalidPVCSnafu, KubeSnafu, Result, WALLE,
 };
 use kube::{
     api::{DeleteParams, ListParams, Patch, PatchParams, PostParams},
@@ -25,7 +28,9 @@ use kube::{
     },
     Api, Resource, ResourceExt,
 };
-use snafu::ResultExt as _;
+use snafu::{OptionExt, ResultExt as _};
+
+use super::SourcePvc;
 
 impl BackupSchedule {
     pub async fn reconcile(&self, ctx: Arc<Context<Self>>) -> Result<Action> {
@@ -211,18 +216,17 @@ impl BackupSchedule {
                     let pvc_meta =
                         (pod.meta().namespace.clone().unwrap(), claim.claim_name.clone());
 
-                    pvcs.insert(pvc_meta, plan);
+                    // Ensure first plan wins if a PVC is referenced multiple times
+                    if pvcs.get(&pvc_meta).is_none() {
+                        pvcs.insert(pvc_meta, plan);
+                    }
                 }
             }
             debug!("Creating BackupJobs for {} PVCs", pvcs.len());
         }
 
         let mut namespaced_jobs = BTreeMap::new();
-
-        // let backup_batch =
-        //     self.status.as_ref().and_then(|x| x.backup_batch.as_ref()).whatever_context(
-        //         "Unable to create BackupJob because schedule doesn't have backupBatch set.",
-        //     )?;
+        let mut namespaced_pvcs = BTreeMap::new();
 
         let set_id = Utc::now().to_k8s_label();
 
@@ -257,8 +261,28 @@ impl BackupSchedule {
 
         for ((pvc_ns, pvc_name), plan) in pvcs {
             let api = namespaced_jobs
-                .entry(pvc_ns)
+                .entry(pvc_ns.clone())
                 .or_insert_with_key(|ns| Api::<BackupJob>::namespaced(ctx.kube.client(), ns));
+            let pvc_api = namespaced_pvcs.entry(pvc_ns.clone()).or_insert_with_key(|ns| {
+                Api::<PersistentVolumeClaim>::namespaced(ctx.kube.client(), ns)
+            });
+
+            // Ensure there's a snap_class_mapping, if not skip PVC
+            let Some(pvc) = pvc_api
+                .get_opt(&pvc_name)
+                .await
+                .context(KubeSnafu { msg: "Failed to get PVC referenced by workload to backup" })?
+            else {
+                error!(pvc_ns, pvc_name, "Unable to located PVC referenced in workload to backup");
+                continue;
+            };
+            let pvc = SourcePvc(pvc);
+            let snap_class = pvc.source_pvc_snap_class(&ctx.config.snap_class_mappings);
+
+            if snap_class.is_none() {
+                warn!(pvc_ns, pvc_name, "PVC referenced in workload is in storage class which has no volumesnapshotclass mapping. Skipping backup.");
+                continue;
+            }
 
             api.create(
                 &PostParams::default(),
