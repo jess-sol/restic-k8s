@@ -254,7 +254,11 @@ fn do_prune(
     }
 
     let retention: RetentionSpec = retain.parse().expect("Failed to parse RetentionSpec");
-    let mut args = vec!["forget".into(), "--retry-lock".into(), "2h".into()];
+    let mut args: Vec<_> =
+        vec!["forget", "--retry-lock", "2h", "--keep-tag", "forever", "--group-by", "host,tags"]
+            .into_iter()
+            .map(String::from)
+            .collect();
     args.append(&mut retention.as_args());
 
     info!("Forgetting old snapshots");
