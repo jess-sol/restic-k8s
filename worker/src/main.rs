@@ -210,7 +210,7 @@ fn do_check(
     }
 
     let mut process = Command::new(restic_path)
-        .args(["check"])
+        .args(["check", "--retry-lock", "2h"])
         .envs(repo_env_vars)
         .spawn()
         .with_context(|_| ProcessSpawnSnafu)?;
@@ -254,7 +254,7 @@ fn do_prune(
     }
 
     let retention: RetentionSpec = retain.parse().expect("Failed to parse RetentionSpec");
-    let mut args = vec!["forget".into()];
+    let mut args = vec!["forget".into(), "--retry-lock".into(), "2h".into()];
     args.append(&mut retention.as_args());
 
     info!("Forgetting old snapshots");
@@ -273,7 +273,7 @@ fn do_prune(
 
     info!("Pruning after forgetting snapshots");
     let mut process = Command::new(&restic_path)
-        .args(["prune"])
+        .args(["prune", "--retry-lock", "2h"])
         .envs(repo_env_vars)
         .spawn()
         .with_context(|_| ProcessSpawnSnafu)?;
