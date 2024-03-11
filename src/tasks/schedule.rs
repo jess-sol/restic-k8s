@@ -6,6 +6,7 @@ use k8s_openapi::{
     },
     apimachinery::pkg::apis::meta::v1::{Condition, Time},
 };
+use serde::de::DeserializeOwned;
 use serde_json::json;
 use std::{
     cmp::Reverse,
@@ -46,7 +47,7 @@ impl BackupSchedule {
 
         let backup_schedules: Api<BackupSchedule> = Api::all(ctx.kube.client());
         let backup_sets: Api<BackupSet> = Api::all(ctx.kube.client());
-        let job_api: Api<Job> = Api::all(ctx.kube.client());
+        let job_api: Api<Job> = Api::namespaced(ctx.kube.client(), &ctx.kube.operator_namespace);
 
         let recorder = ctx.kube.recorder(self);
 
@@ -78,43 +79,10 @@ impl BackupSchedule {
         let mut sets = sets.items;
         sets.sort_unstable_by_key(|x| Reverse(x.creation_timestamp()));
 
-        // Delete extra sets
-        let to_delete = sets
-            .iter()
-            .filter(|x| x.status.as_ref().map(|x| &x.state) == Some(&BackupSetState::Finished))
-            .skip(self.spec.keep_succeeded)
-            .chain(
-                sets.iter()
-                    .filter(|x| {
-                        x.status.as_ref().map(|x| &x.state)
-                            == Some(&BackupSetState::FinishedWithFailures)
-                    })
-                    .skip(self.spec.keep_failed),
-            )
-            .map(|x| (x.name_any(), x.object_ref(&())));
-
-        for (set_name, set_ref) in to_delete {
-            info!(backup_schedule = name, backup_set = set_name, "Cleaning up old BackupSet");
-            if let Err(err) = backup_sets.delete(&set_name, &DeleteParams::default()).await {
-                error!(
-                    backup_schedule = name,
-                    backup_set = set_name,
-                    ?err,
-                    "Failed to cleanup old BackupSet"
-                );
-            } else if let Err(err) = recorder
-                .publish(Event {
-                    type_: EventType::Warning,
-                    reason: "DeletedOldBackupSet".into(),
-                    note: Some("Deleted old BackupSet".into()),
-                    action: "DeletingBackupSet".into(),
-                    secondary: Some(set_ref),
-                })
-                .await
-            {
-                error!(name, ?err, "Failed to add event to backup schedule");
-            }
-        }
+        // Delete extra BackupSets
+        self.delete_old(&backup_sets, &ctx, "").await?;
+        self.delete_old(&job_api, &ctx, "check").await?;
+        self.delete_old(&job_api, &ctx, "prune").await?;
 
         let mut new_conditions = Vec::new();
 
@@ -474,6 +442,92 @@ impl BackupSchedule {
             .unwrap();
         }
         Ok(())
+    }
+
+    async fn delete_old<
+        T: Clone + std::fmt::Debug + DeserializeOwned + Resource<DynamicType = ()> + JobState,
+    >(
+        &self, api: &Api<T>, ctx: &Context<BackupSchedule>, job_type: &str,
+    ) -> Result<()> {
+        let recorder = ctx.kube.recorder(self);
+        let kind = T::kind(&());
+        let name = self.name_any();
+        let mut labels = format!("ros.io/backup-schedule={name}");
+        if !job_type.is_empty() {
+            labels = format!("{labels},ros.io/backup-job-type={job_type}");
+        }
+
+        let list = api
+            .list(&ListParams::default().labels(&labels))
+            .await
+            .context(KubeSnafu { msg: format!("Failed to get {kind} for BackupSchedule") })?;
+
+        let mut items = list.items;
+        items.sort_unstable_by_key(|x| Reverse(x.creation_timestamp()));
+        let to_delete = items
+            .iter()
+            .filter(|x| x.succeeded())
+            .skip(self.spec.keep_succeeded)
+            .chain(items.iter().filter(|x| x.failed()).skip(self.spec.keep_failed))
+            .map(|x| (x.name_any(), x.object_ref(&())));
+
+        for (item_name, item_ref) in to_delete {
+            info!(backup_schedule = name, backup_set = item_name, "Cleaning up old {kind}");
+            if let Err(err) = api.delete(&item_name, &DeleteParams::default()).await {
+                error!(backup_schedule = name, item_name, ?err, "Failed to cleanup old {kind}");
+            } else if let Err(err) = recorder
+                .publish(Event {
+                    type_: EventType::Warning,
+                    reason: format!("DeletedOld{kind}"),
+                    note: Some(format!("Deleted old {kind}")),
+                    action: format!("Deleting{kind}"),
+                    secondary: Some(item_ref),
+                })
+                .await
+            {
+                error!(name, ?err, "Failed to add event to BackupSchedule");
+            }
+        }
+
+        Ok(())
+    }
+}
+
+trait JobState {
+    fn succeeded(&self) -> bool;
+    fn failed(&self) -> bool;
+    fn active(&self) -> bool;
+}
+
+impl JobState for BackupSet {
+    fn succeeded(&self) -> bool {
+        self.status.as_ref().map(|x| x.state == BackupSetState::Finished).unwrap_or(false)
+    }
+
+    fn failed(&self) -> bool {
+        self.status
+            .as_ref()
+            .map(|x| x.state == BackupSetState::FinishedWithFailures)
+            .unwrap_or(false)
+    }
+
+    fn active(&self) -> bool {
+        self.status.as_ref().map(|x| x.state == BackupSetState::Running).unwrap_or(false)
+    }
+}
+
+impl JobState for Job {
+    fn succeeded(&self) -> bool {
+        self.status.as_ref().and_then(|x| x.succeeded).unwrap_or(0) > 0
+    }
+
+    fn failed(&self) -> bool {
+        let backoff_limit = self.spec.as_ref().and_then(|x| x.backoff_limit).unwrap_or(3);
+        self.status.as_ref().and_then(|x| x.failed).unwrap_or(0) > backoff_limit
+    }
+
+    fn active(&self) -> bool {
+        self.status.as_ref().and_then(|x| x.active).unwrap_or(0) > 0
     }
 }
 
