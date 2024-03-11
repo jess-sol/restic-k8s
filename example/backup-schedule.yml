@@ -4,7 +4,13 @@ kind: BackupSchedule
 metadata:
   name: example-backup-schedule
 spec:
-  interval: 60s
+  interval: 1m
+  prune:
+    interval: 2m
+    retain:
+      hourly: 1
+  check:
+    interval: 2m
   plans:
   - type: pod
     labelSelector:
