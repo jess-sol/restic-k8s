@@ -456,20 +456,25 @@ async fn cleanup_backup_job(
         ..Default::default()
     };
     if let Some(job) = job {
-        let jobs: Api<Job> = Api::namespaced(ctx.kube.client(), &backup_job.namespace().unwrap());
-        if let Err(err) = jobs.delete(&job.0.name_any(), &dp).await {
-            error!(?err, "Failed to cleanup Job subresource");
+        if job.0.meta().deletion_timestamp.is_none() {
+            let jobs: Api<Job> =
+                Api::namespaced(ctx.kube.client(), &backup_job.namespace().unwrap());
+            if let Err(err) = jobs.delete(&job.0.name_any(), &dp).await {
+                error!(?err, "Failed to cleanup Job subresource");
+            }
         }
     }
 
     if let Some(snapshot) = snapshot {
-        let snapshots = Api::<DynamicObject>::namespaced_with(
-            ctx.kube.client(),
-            &backup_job.namespace().unwrap(),
-            &ctx.kube.snapshot_ar,
-        );
-        if let Err(ref err) = snapshots.delete(&snapshot.0.name_any(), &dp).await {
-            error!(?err, "Failed to cleanup Snapshot subresource");
+        if snapshot.0.meta().deletion_timestamp.is_none() {
+            let snapshots = Api::<DynamicObject>::namespaced_with(
+                ctx.kube.client(),
+                &backup_job.namespace().unwrap(),
+                &ctx.kube.snapshot_ar,
+            );
+            if let Err(ref err) = snapshots.delete(&snapshot.0.name_any(), &dp).await {
+                error!(?err, "Failed to cleanup Snapshot subresource");
+            }
         }
     }
 
