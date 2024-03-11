@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    fs::read_to_string,
+    fs::{read_dir, read_to_string},
     io,
     ops::Deref,
     process::{Command, ExitCode, ExitStatus},
@@ -11,7 +11,7 @@ use k8s_openapi::api::core::v1::Secret;
 use kube::Api;
 use snafu::{Backtrace, ResultExt, Snafu};
 use tokio::runtime::Builder;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{prelude::*, EnvFilter};
 
 use crate::retention::RetentionSpec;
@@ -142,6 +142,12 @@ fn do_backup(
         snapshot_time
     );
     debug!("Starting restic {}", restic_path);
+
+    // Check if source directory is empty
+    if read_dir(&source_path).map(|x| x.count()).unwrap_or(0) == 0 {
+        warn!("Snapshot of PVC is empty, skipping backup.");
+        return Ok(());
+    }
 
     if repo_env_vars.get("INITIALIZE_REPO").map(|x| is_truthy(x.as_str())).unwrap_or(false) {
         info!("Ensuring repository is initialized");
