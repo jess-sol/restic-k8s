@@ -29,7 +29,7 @@ pub mod telemetry;
 
 pub use error::*;
 
-use crate::crd::{BACKUP_JOB_FINALIZER, BACKUP_SET_FINALIZER};
+use crate::crd::{BACKUP_JOB_FINALIZER, BACKUP_SCHEDULE_FINALIZER, BACKUP_SET_FINALIZER};
 
 pub const WALLE: &str = "walle";
 
@@ -166,7 +166,7 @@ async fn reconcile_backup_schedule(
     let backup_schedules: Api<BackupSchedule> = Api::all(ctx.kube.client());
 
     info!("Reconciling BackupSchedule {}", backup_schedule.name_any());
-    finalizer(&backup_schedules, BACKUP_JOB_FINALIZER, backup_schedule, |event| async {
+    finalizer(&backup_schedules, BACKUP_SCHEDULE_FINALIZER, backup_schedule, |event| async {
         match event {
             FinalizerEvent::Cleanup(backup_schedule) => backup_schedule.cleanup(ctx.clone()).await,
             FinalizerEvent::Apply(backup_schedule) => backup_schedule.reconcile(ctx.clone()).await,
