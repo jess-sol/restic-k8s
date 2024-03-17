@@ -80,12 +80,55 @@ Getting Started
         namespace: walle
     EOF
     ```
+Restoring
+---
+
+Right now restoring backups is a manual process. Likely there'll never be a
+restore job type CRD, but instead a CLI command run from an administrator's
+workstation which will restore files to PVs in a cluster.
+
+Here is an example of a manual restoration:
+
+1. Ensure no reconciliation loop is running on workload being restored, then
+   delete any pods utilizing PVC to be restored
+
+2. Create new pod which mounts PVC
+    ```yaml
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: restic-restore
+      namespace: <NAMESPACE>
+    spec:
+      containers:
+      - name: postgres
+        image: debian:stable-slim
+        command: [sleep, infinity]
+        volumeMounts:
+        - mountPath: /data
+          name: restore
+      volumes:
+      - name: restore
+        persistentVolumeClaim:
+          claimName: <PVC NAME TO RESTORE TO>
+    ```
+
+3. Mount Restic backups, this'll allow ownership and permissions to kept
+    ```bash
+    mkdir tmp
+    resticprofile <PROFILE>.mount --tag <PVC NAME> tmp/
+    ```
+
+4. Finally restore!
+    ```bash
+    tar -C tmp/tags/<PVC NAME>/latest -cf - . | pv | kubectl exec -i -n <NAMESPACE> restic-restore -- tar -C /data -xf -
+    ```
 
 Building images
 ---
 ```bash
-docker build -f worker/Dockerfile . -t ghcr.io/jess-sol/walle/worker:latest --push
-docker build . -t ghcr.io/jess-sol/walle/operator:latest --push
+docker build -f worker/Dockerfile . -t ghcr.io/jess-sol/walle/worker:latest
+docker build . -t ghcr.io/jess-sol/walle/operator:latest
 ```
 
 Development
@@ -99,9 +142,7 @@ cargo run --bin crdgen | k apply -f -
 k apply -f example/workload.yml
 k create secret generic restic-rest-config --from-env-file=example/restic-secret.env
 
-RUST_LOG=info,walle=debug APP_CONFIG=example/config.yml cargo run
-# Or with Helm
-helm upgrade --install walle ./helm/charts/walle -f example/values.yml
+RUST_LOG=info,walle=debug APP_CONFIG=example/config.yml cargo run # Or with Helm
 
 k apply -f example/backup-job.yml
 # Or
