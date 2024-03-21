@@ -87,15 +87,20 @@ impl BackupSchedule {
         let mut new_conditions = Vec::new();
 
         // Set BackupReady condition based on Job state
-        if let Some(status) = sets.first().and_then(|x| x.status.as_ref()) {
-            let backup_condition = PartialCondition {
+        let backup_condition = if let Some(status) = sets.first().and_then(|x| x.status.as_ref()) {
+            PartialCondition {
                 reason: status.state.as_str(),
                 status: if status.state == BackupSetState::Finished { "True" } else { "False" },
                 message: "BackupSet state",
-            };
-            new_conditions
-                .push(backup_condition.into_condition("BackupReady", self.meta().generation));
-        }
+            }
+        } else {
+            PartialCondition {
+                reason: "Waiting",
+                status: "False",
+                message: "No BackupSets found for BackupSchedule",
+            }
+        };
+        new_conditions.push(backup_condition.into_condition("BackupReady", self.meta().generation));
 
         // Set CheckOk condition based on BackupSet state
         let check_jobs = job_api
