@@ -39,6 +39,12 @@ spec:
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         env:
+        {{- if .Values.debug }}
+        - name: RUST_LOG
+          value: info,walle=debug
+        - name: RUST_BACKTRACE
+          value: "1"
+        {{- end }}
         - name: APP_CONFIG
           value: /config/config.yml
         resources:

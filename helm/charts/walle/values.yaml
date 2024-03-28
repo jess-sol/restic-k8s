@@ -1,3 +1,5 @@
+debug: false
+
 image:
   repository: ghcr.io/jess-sol/walle/operator
   pullPolicy: Always
