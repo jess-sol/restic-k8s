@@ -86,6 +86,19 @@ impl DateTimeFormatK8s for DateTime<Utc> {
     }
 }
 
+pub fn build_label_filter(
+    selector: Option<&LabelSelector>, additional_label_selector: &[&str],
+) -> String {
+    let mut selectors = additional_label_selector.to_vec();
+    let to_filter;
+    if let Some(selector) = selector {
+        to_filter = label_selector_to_filter(selector);
+        selectors.push(&to_filter);
+    }
+
+    selectors.join(",")
+}
+
 pub fn label_selector_to_filter(selector: &LabelSelector) -> String {
     let mut result = Vec::new();
 

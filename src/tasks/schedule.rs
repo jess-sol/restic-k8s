@@ -23,7 +23,7 @@ use crate::{
         BackupSetState, RetentionSpec,
     },
     tasks::{
-        field_selector_to_filter,
+        build_label_filter, field_selector_to_filter,
         job::{create_job, JobType},
         label_selector_to_filter, update_conditions, DateTimeFormatK8s, PartialCondition,
     },
@@ -327,10 +327,10 @@ impl BackupSchedule {
             assert_eq!(plan.type_, "pod", "Currently only able to target pods");
             let api: Api<Pod> = Api::all(ctx.kube.client());
 
-            let mut lp = ListParams::default();
-            if let Some(ref ls) = plan.label_selector {
-                lp = lp.labels(&label_selector_to_filter(ls));
-            }
+            let mut lp = ListParams::default().labels(&build_label_filter(
+                plan.label_selector.as_ref(),
+                &[&format!("app.kubernetes.io/created-by!={WALLE}")],
+            ));
             if let Some(ref fs) = plan.field_selector {
                 lp = lp.fields(&field_selector_to_filter(fs));
             }
